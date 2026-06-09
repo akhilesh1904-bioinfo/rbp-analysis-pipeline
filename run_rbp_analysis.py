@@ -72,6 +72,10 @@ def parse_args():
     p = argparse.ArgumentParser(description="Generalised RBP analysis pipeline")
     p.add_argument("--input",    required=True, help="Path to eCLIP BED file")
     p.add_argument("--name",     required=True, help="Protein name (used for output folder/filenames)")
+    p.add_argument("--genome", required=True, help="Path to GRCh38 genome FASTA")
+    p.add_argument("--gtf", required=False, default=None, help="Path to GENCODE GTF file")
+    p.add_argument("--genes-bed", required=True, help="Path to genes_only.bed")
+    p.add_argument("--output-dir", default="./results", help="Output directory (default: ./results)")
     p.add_argument("--negatives", default=None, help="(Optional) pre-computed negatives BED — skips generation")
     p.add_argument("--test-chroms", nargs="+", default=["chr21", "chr22", "chrX"],
                    help="Chromosomes held out for final AUC test (default: chr21 chr22 chrX)")
@@ -764,7 +768,7 @@ def generate_report(peaks_df, results, out_dir, name, test_chroms, val_chroms):
 
     js = f"""
 const {{ Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
-         AlignmentType, HeadingLevel, BorderStyle, WidthType, ShadingType }} = require('/mnt/c/Users/AKHILESH NAIK/Desktop/RBP_Internship/node_modules/docx');
+         AlignmentType, HeadingLevel, BorderStyle, WidthType, ShadingType }} = require(require('path').join(__dirname, 'node_modules', 'docx'));
 const fs = require('fs');
 
 const border  = {{ style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" }};
@@ -901,10 +905,10 @@ Packer.toBuffer(doc).then(buf => {{
         f.write(js)
 
     # Install docx if needed
-    check = subprocess.run(["node", "-e", "require('/mnt/c/Users/AKHILESH NAIK/Desktop/RBP_Internship/node_modules/docx')"], capture_output=True)
+    check = subprocess.run(["node", "-e", "require(require('path').join(__dirname, 'node_modules', 'docx'))"], capture_output=True)
     if check.returncode != 0:
         print("  Installing docx npm package...")
-        subprocess.run(["npm", "install", "--prefix", "/mnt/c/Users/AKHILESH NAIK/Desktop/RBP_Internship", "docx"], check=True)
+        subprocess.run(["npm", "install", "--prefix", str(Path(__file__).parent), "docx"], check=True)
 
     result = subprocess.run(["node", str(js_path)], capture_output=True, text=True)
     js_path.unlink(missing_ok=True)
@@ -938,7 +942,7 @@ def main():
         print(f"ERROR: Input file not found: {bed_in}")
         sys.exit(1)
 
-    out_dir = setup_output_dir(name)
+    out_dir = setup_output_dir(name, args.output_dir)
     print(f"  Output dir   : {out_dir}")
 
     # Steps
