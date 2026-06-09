@@ -86,8 +86,8 @@ def parse_args():
     return p.parse_args()
 
 
-def setup_output_dir(name: str) -> Path:
-    out = BASE_DIR / "results" / name
+def setup_output_dir(name: str, output_dir: str = "./results") -> Path:
+    out = Path(output_dir) / name
     out.mkdir(parents=True, exist_ok=True)
     (out / "figures").mkdir(exist_ok=True)
     return out
