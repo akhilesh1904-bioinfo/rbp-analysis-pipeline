@@ -29,11 +29,12 @@ npm install --prefix . docx
 ## Usage
 
 python run_rbp_analysis.py \
-    --input     MY_PROTEIN_peaks.bed \
-    --name      MY_PROTEIN \
-    --genome    /path/to/GRCh38.fa \
-    --gtf       /path/to/gencode.gtf \
-    --genes-bed /path/to/genes_only.bed
+    --input      MY_PROTEIN_peaks.bed \
+    --name       MY_PROTEIN \
+    --genome     /path/to/GRCh38.fa \
+    --gtf        /path/to/gencode.gtf \
+    --genes-bed  /path/to/genes_only.bed \
+    --output-dir ./results
 
 ## License
 MIT
