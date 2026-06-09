@@ -54,10 +54,10 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────────────────────────────────────────────────────────
 # FIXED PATHS
 # ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR     = Path("/mnt/c/Users/AKHILESH NAIK/Desktop/RBP_Internship")
-GENOME_FA    = Path("/mnt/c/Users/AKHILESH NAIK/Desktop/MSc_TDP43_Project/Data/Raw/GRCh38.primary_assembly.genome.fa")
-GENES_BED    = Path("/mnt/c/Users/AKHILESH NAIK/Desktop/MSc_TDP43_Project/Data/Raw/genes_only.bed")
-GTF_FILE     = Path("/mnt/c/Users/AKHILESH NAIK/Desktop/MSc_TDP43_Project/Data/Raw/gencode.v49.primary_assembly.annotation.gtf")
+# Paths are set at runtime via --genome / --gtf / --genes-bed arguments
+GENOME_FA = None
+GENES_BED = None
+GTF_FILE  = None
 
 RANDOM_STATE = 42
 MAX_LEN      = 126
