@@ -4,37 +4,40 @@ run_rbp_analysis.py
 ===================
 Generalised RNA-binding protein (RBP) analysis pipeline.
 
-Given any eCLIP BED file, this script:
-  1. Validates and cleans the BED file
-  2. Generates matched negative regions via bedtools shuffle
-  3. Extracts sequences from GRCh38
+Given an ENCODE-style eCLIP BED file (GRCh38, chr-prefixed), this script:
+  1. Validates and cleans the BED file (optional ENCODE significance filters)
+  2. Generates length- and chromosome-matched negative regions (bedtools shuffle)
+  3. Extracts strand-aware sequences from the genome
   4. Trains CNN + LR models on that protein's own data (chromosome split)
-  5. Evaluates on held-out test chromosomes → AUC
+  5. Evaluates on held-out test chromosomes -> AUC
   6. Saves ROC curve + score distribution plots
   7. Annotates peaks (exonic/intronic/UTR/intergenic)
-  8. Generates predictions CSV + Word report
+  8. Generates predictions CSV (with split labels) + Word report
 
 Usage:
-    python run_rbp_analysis.py --input data/MY_PROTEIN_peaks.bed --name MY_PROTEIN
+    python run_rbp_analysis.py --input peaks.bed --name MY_PROTEIN \\
+        --genome GRCh38.fa --genes-bed genes_only.bed [--gtf gencode.gtf]
 
 Optional:
     --test-chroms chr21 chr22 chrX     (default)
-    --val-chroms  chr19 chr20           (default)
-    --skip-annotation                   (skip GTF step, faster)
-    --negatives   path/to/neg.bed       (skip generation, use existing)
+    --val-chroms  chr19 chr20          (default)
+    --negatives   path/to/neg.bed      (skip generation, use existing)
+    --min-log2fc 3 --min-log10p 3      (ENCODE-recommended peak thresholds)
+    --max-len 126                      (CNN input length; longer peaks centre-cropped)
+    --skip-annotation / --skip-report
 
-Outputs → results/MY_PROTEIN/
+Outputs -> <output-dir>/<name>/
 """
 
 import argparse
-import os
+import json
 import random
 import re
 import subprocess
 import sys
 import warnings
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -52,38 +55,84 @@ from sklearn.metrics import roc_auc_score, roc_curve
 warnings.filterwarnings("ignore")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIXED PATHS
+# RUNTIME CONFIGURATION (set by configure() from command-line arguments)
 # ─────────────────────────────────────────────────────────────────────────────
-# Paths are set at runtime via --genome / --gtf / --genes-bed arguments
-GENOME_FA = None
-GENES_BED = None
-GTF_FILE  = None
+GENOME_FA: Optional[Path] = None
+GENES_BED: Optional[Path] = None
+GTF_FILE:  Optional[Path] = None
 
 RANDOM_STATE = 42
 MAX_LEN      = 126
+MAX_N_FRACTION = 0.10      # sequences with more ambiguous bases than this are dropped
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SCRIPT_DIR   = Path(__file__).resolve().parent
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ARGUMENT PARSING
+# ARGUMENT PARSING & CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Generalised RBP analysis pipeline")
     p.add_argument("--input",    required=True, help="Path to eCLIP BED file")
     p.add_argument("--name",     required=True, help="Protein name (used for output folder/filenames)")
-    p.add_argument("--genome", required=True, help="Path to GRCh38 genome FASTA")
-    p.add_argument("--gtf", required=False, default=None, help="Path to GENCODE GTF file")
-    p.add_argument("--genes-bed", required=True, help="Path to genes_only.bed")
+    p.add_argument("--genome",   required=True, help="Path to GRCh38 genome FASTA (chr-prefixed names)")
+    p.add_argument("--gtf",      default=None, help="(Optional) GENCODE GTF for region annotation")
+    p.add_argument("--genes-bed", default=None,
+                   help="Gene intervals BED used to constrain negatives (required unless --negatives)")
     p.add_argument("--output-dir", default="./results", help="Output directory (default: ./results)")
     p.add_argument("--negatives", default=None, help="(Optional) pre-computed negatives BED — skips generation")
     p.add_argument("--test-chroms", nargs="+", default=["chr21", "chr22", "chrX"],
                    help="Chromosomes held out for final AUC test (default: chr21 chr22 chrX)")
     p.add_argument("--val-chroms",  nargs="+", default=["chr19", "chr20"],
                    help="Chromosomes held out for validation (default: chr19 chr20)")
-    p.add_argument("--skip-annotation", action="store_true",
-                   help="Skip GTF region annotation (faster)")
-    return p.parse_args()
+    p.add_argument("--min-log2fc", type=float, default=None,
+                   help="Keep peaks with log2 fold-enrichment (BED column 7) >= this. ENCODE uses 3.")
+    p.add_argument("--min-log10p", type=float, default=None,
+                   help="Keep peaks with -log10 p-value (BED column 8) >= this. ENCODE uses 3.")
+    p.add_argument("--max-len", type=int, default=126,
+                   help="CNN input length in bp; longer sequences are centre-cropped (default: 126)")
+    p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    p.add_argument("--skip-annotation", action="store_true", help="Skip GTF region annotation")
+    p.add_argument("--skip-report", action="store_true", help="Skip Word report generation")
+    return p.parse_args(argv)
+
+
+def configure(args) -> None:
+    """Set module-level paths/parameters from parsed arguments and check they exist."""
+    global GENOME_FA, GENES_BED, GTF_FILE, MAX_LEN, RANDOM_STATE
+
+    GENOME_FA = Path(args.genome)
+    if not GENOME_FA.exists():
+        sys.exit(f"ERROR: genome FASTA not found: {GENOME_FA}")
+
+    if args.negatives is None and args.genes_bed is None:
+        sys.exit("ERROR: --genes-bed is required unless --negatives is provided")
+    GENES_BED = Path(args.genes_bed) if args.genes_bed else None
+    if GENES_BED is not None and not GENES_BED.exists():
+        sys.exit(f"ERROR: genes BED not found: {GENES_BED}")
+
+    GTF_FILE = Path(args.gtf) if args.gtf else None
+    if GTF_FILE is not None and not GTF_FILE.exists():
+        sys.exit(f"ERROR: GTF not found: {GTF_FILE}")
+
+    if args.negatives and not Path(args.negatives).exists():
+        sys.exit(f"ERROR: negatives BED not found: {args.negatives}")
+
+    if args.max_len < 8:
+        sys.exit("ERROR: --max-len must be at least 8")
+    MAX_LEN = args.max_len
+    RANDOM_STATE = args.seed
+
+
+def set_seed(seed: int) -> None:
+    """Seed every random number generator the pipeline uses."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def setup_output_dir(name: str, output_dir: str = "./results") -> Path:
@@ -94,54 +143,187 @@ def setup_output_dir(name: str, output_dir: str = "./results") -> Path:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 — VALIDATE & CLEAN BED
+# CHROMOSOME NAMING & GENOME CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
 VALID_CHROMS = {f"chr{i}" for i in range(1, 23)} | {"chrX", "chrY", "chrM"}
 
-def validate_bed(bed_path: Path, out_dir: Path) -> pd.DataFrame:
+
+def normalise_chrom(chrom: str) -> str:
+    """Convert Ensembl-style names (1, X, MT) to UCSC/GENCODE style (chr1, chrX, chrM)."""
+    if chrom.startswith("chr"):
+        return chrom
+    if chrom in ("MT", "M"):
+        return "chrM"
+    return "chr" + chrom
+
+
+def ensure_fai() -> Optional[Path]:
+    """Return the genome .fai index, creating it with samtools if possible."""
+    fai = Path(str(GENOME_FA) + ".fai")
+    if not fai.exists():
+        try:
+            subprocess.run(["samtools", "faidx", str(GENOME_FA)],
+                           check=True, capture_output=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return None
+    return fai if fai.exists() else None
+
+
+def read_fai_sizes(fai: Path) -> Dict[str, int]:
+    sizes = {}
+    with open(fai) as f:
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 2:
+                sizes[p[0]] = int(p[1])
+    return sizes
+
+
+def genome_chrom_names() -> List[str]:
+    fai = ensure_fai()
+    if fai is not None:
+        return list(read_fai_sizes(fai))
+    names = []
+    with open(GENOME_FA) as f:
+        for line in f:
+            if line.startswith(">"):
+                names.append(line[1:].split()[0])
+    return names
+
+
+def check_reference_naming() -> None:
+    """Fail early if the genome or genes BED don't use chr-prefixed chromosome names."""
+    names = genome_chrom_names()
+    if names and not any(n.startswith("chr") for n in names):
+        sys.exit("ERROR: genome FASTA uses Ensembl-style chromosome names (1, 2, X...). "
+                 "Use a GENCODE/UCSC GRCh38 FASTA with chr-prefixed names.")
+    if GENES_BED is not None:
+        with open(GENES_BED) as f:
+            for line in f:
+                if line.strip() and not line.startswith(("#", "track", "browser")):
+                    if not line.split("\t")[0].startswith("chr"):
+                        sys.exit("ERROR: genes BED uses chromosome names without 'chr' prefix; "
+                                 "it must match the genome FASTA naming.")
+                    break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — VALIDATE & CLEAN BED
+# ─────────────────────────────────────────────────────────────────────────────
+
+BED_COLS = ["chrom", "start", "end", "name", "score", "strand"]
+
+
+def _to_float(value: str) -> Optional[float]:
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def validate_bed(bed_path: Path, out_dir: Path,
+                 min_log2fc: Optional[float] = None,
+                 min_log10p: Optional[float] = None) -> pd.DataFrame:
     print("\n[1/8] Validating BED file...")
-    rows, skipped = [], 0
+    rows = []
+    skipped = renamed = filtered = 0
     with open(bed_path) as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith(("#", "track", "browser")):
+            line = line.rstrip("\n")
+            if not line.strip() or line.startswith(("#", "track", "browser")):
                 continue
             cols = line.split("\t")
             if len(cols) < 3:
                 skipped += 1; continue
-            chrom = cols[0]
+            raw_chrom = cols[0]
+            chrom = normalise_chrom(raw_chrom)
             try:
                 start, end = int(cols[1]), int(cols[2])
             except ValueError:
                 skipped += 1; continue
-            if end <= start or chrom not in VALID_CHROMS:
+            if start < 0 or end <= start or chrom not in VALID_CHROMS:
                 skipped += 1; continue
+            strand = cols[5] if len(cols) > 5 else "."
+            if strand not in ("+", "-", "."):
+                skipped += 1; continue
+
+            log2fc = _to_float(cols[6]) if len(cols) > 6 else None
+            log10p = _to_float(cols[7]) if len(cols) > 7 else None
+            if min_log2fc is not None and (log2fc is None or log2fc < min_log2fc):
+                filtered += 1; continue
+            if min_log10p is not None and (log10p is None or log10p < min_log10p):
+                filtered += 1; continue
+
+            if chrom != raw_chrom:
+                renamed += 1
             rows.append({
                 "chrom":  chrom,
                 "start":  start,
                 "end":    end,
                 "name":   cols[3] if len(cols) > 3 else ".",
-                "score":  float(cols[4]) if len(cols) > 4 else 0.0,
-                "strand": cols[5] if len(cols) > 5 else ".",
+                "score":  _to_float(cols[4]) if len(cols) > 4 else 0.0,
+                "strand": strand,
+                "log2fc": log2fc,
+                "log10p": log10p,
             })
+
+    if not rows:
+        sys.exit(f"ERROR: no usable peaks in {bed_path} "
+                 f"({skipped:,} invalid lines, {filtered:,} removed by significance filters). "
+                 "Expected tab-separated BED with chromosomes chr1-22/X/Y/M (or 1-22/X/Y/MT).")
 
     df = pd.DataFrame(rows)
     before = len(df)
-    df = df.drop_duplicates(subset=["chrom", "start", "end"])
+    # Same interval on opposite strands = two different RNA binding events, so keep strand in the key
+    df = df.drop_duplicates(subset=["chrom", "start", "end", "strand"]).reset_index(drop=True)
     df["peak_length"] = df["end"] - df["start"]
+    df["peak_id"] = [f"peak_{i}" for i in range(len(df))]
 
     print(f"  Peaks loaded        : {len(df):,}")
     print(f"  Skipped (invalid)   : {skipped:,}")
+    if min_log2fc is not None or min_log10p is not None:
+        print(f"  Removed by filters  : {filtered:,} (log2FC >= {min_log2fc}, -log10p >= {min_log10p})")
+    if renamed:
+        print(f"  Chrom names fixed   : {renamed:,} (e.g. '1' -> 'chr1')")
     print(f"  Duplicates removed  : {before - len(df):,}")
     print(f"  Chromosomes         : {sorted(df['chrom'].unique())}")
     print(f"  Peak length range   : {df['peak_length'].min()}–{df['peak_length'].max()} bp")
     print(f"  Median peak length  : {int(df['peak_length'].median())} bp")
+    n_unstranded = int((df["strand"] == ".").sum())
+    if n_unstranded:
+        print(f"  WARNING: {n_unstranded:,} peaks have no strand ('.'); the + strand will be used. "
+              "eCLIP is stranded — check your input.")
 
     cleaned = out_dir / "peaks_cleaned.bed"
-    df[["chrom","start","end","name","score","strand"]].to_csv(
-        cleaned, sep="\t", index=False, header=False)
+    out = df[["chrom", "start", "end", "peak_id", "score", "strand"]].copy()
+    out["score"] = out["score"].fillna(0)
+    out.to_csv(cleaned, sep="\t", index=False, header=False)
     print(f"  Cleaned BED saved   : {cleaned}")
+    return df
+
+
+def read_bed(path: Path, id_prefix: str) -> pd.DataFrame:
+    """Read a simple BED (>=3 columns) into a DataFrame with a stable ID per row."""
+    rows = []
+    with open(path) as f:
+        for line in f:
+            if not line.strip() or line.startswith(("#", "track", "browser")):
+                continue
+            cols = line.rstrip("\n").split("\t")
+            if len(cols) < 3:
+                continue
+            try:
+                start, end = int(cols[1]), int(cols[2])
+            except ValueError:
+                continue
+            chrom = normalise_chrom(cols[0])
+            if end <= start or chrom not in VALID_CHROMS:
+                continue
+            rows.append({"chrom": chrom, "start": start, "end": end,
+                         "strand": cols[5] if len(cols) > 5 and cols[5] in ("+", "-") else "."})
+    df = pd.DataFrame(rows, columns=["chrom", "start", "end", "strand"])
+    df[f"{id_prefix}_id"] = [f"{id_prefix}_{i}" for i in range(len(df))]
     return df
 
 
@@ -149,225 +331,264 @@ def validate_bed(bed_path: Path, out_dir: Path) -> pd.DataFrame:
 # STEP 2 — GENERATE MATCHED NEGATIVES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_negatives(peaks_df: pd.DataFrame, out_dir: Path, name: str) -> Path:
+GRCH38_SIZES = {
+    "chr1":248956422,"chr2":242193529,"chr3":198295559,"chr4":190214555,
+    "chr5":181538259,"chr6":170805979,"chr7":159345973,"chr8":145138636,
+    "chr9":138394717,"chr10":133797422,"chr11":135086622,"chr12":133275309,
+    "chr13":114364328,"chr14":107043718,"chr15":101991189,"chr16":90338345,
+    "chr17":83257441,"chr18":80373285,"chr19":58617616,"chr20":64444167,
+    "chr21":46709983,"chr22":50818468,"chrX":156040895,"chrY":57227415,
+}
+
+
+def generate_negatives(out_dir: Path, name: str) -> Path:
     print("\n[2/8] Generating matched negative regions...")
 
     peaks_bed   = out_dir / "peaks_cleaned.bed"
     neg_bed_out = out_dir / f"{name}_negatives.bed"
     genome_file = out_dir / "genome.txt"
 
-    # Build genome sizes from .fai index if available, else use GRCh38 defaults
-    fai = Path(str(GENOME_FA) + ".fai")
-    if fai.exists():
-        chrom_sizes = {}
-        with open(fai) as f:
-            for line in f:
-                p = line.strip().split("\t")
-                if p[0] in VALID_CHROMS:
-                    chrom_sizes[p[0]] = int(p[1])
+    fai = ensure_fai()
+    if fai is not None:
+        chrom_sizes = {c: s for c, s in read_fai_sizes(fai).items() if c in VALID_CHROMS}
     else:
-        print("  Note: genome .fai not found — using standard GRCh38 chromosome sizes")
-        chrom_sizes = {
-            "chr1":248956422,"chr2":242193529,"chr3":198295559,"chr4":190214555,
-            "chr5":181538259,"chr6":170805979,"chr7":159345973,"chr8":145138636,
-            "chr9":138394717,"chr10":133797422,"chr11":135086622,"chr12":133275309,
-            "chr13":114364328,"chr14":107043718,"chr15":101991189,"chr16":90338345,
-            "chr17":83257441,"chr18":80373285,"chr19":58617616,"chr20":64444167,
-            "chr21":46709983,"chr22":50818468,"chrX":156040895,"chrY":57227415,
-        }
+        print("  Note: genome .fai unavailable — using standard GRCh38 chromosome sizes")
+        chrom_sizes = GRCH38_SIZES
 
-    with open(genome_file, "w") as f:
-        for chrom in sorted(chrom_sizes):
-            f.write(f"{chrom}\t{chrom_sizes[chrom]}\n")
+    # Each shuffled region keeps its peak's length (shuffle always does) and its peak's
+    # chromosome, so every split gets negatives from the same chromosomes as its positives.
+    # bedtools' own -chrom flag is silently ignored when combined with -incl (v2.31), so we
+    # shuffle one chromosome at a time instead.
+    peak_lines: Dict[str, List[str]] = {}
+    with open(peaks_bed) as f:
+        for line in f:
+            peak_lines.setdefault(line.split("\t", 1)[0], []).append(line)
+    gene_lines: Dict[str, List[str]] = {}
+    with open(GENES_BED) as f:
+        for line in f:
+            if line.strip() and not line.startswith(("#", "track", "browser")):
+                gene_lines.setdefault(line.split("\t", 1)[0], []).append(line)
 
-    cmd = [
-        "bedtools", "shuffle",
-        "-i", str(peaks_bed),
-        "-g", str(genome_file),
-        "-incl", str(GENES_BED),
-        "-excl", str(peaks_bed),
-        "-noOverlapping",
-        "-maxTries", "1000",
-        "-seed", str(RANDOM_STATE),
-    ]
+    chrom_peaks = out_dir / "_shuffle_peaks.bed"
+    chrom_genes = out_dir / "_shuffle_genes.bed"
+    outputs, skipped = [], []
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        with open(neg_bed_out, "w") as f:
-            f.write(result.stdout)
-        n_neg = result.stdout.strip().count("\n") + 1 if result.stdout.strip() else 0
-        print(f"  Negatives generated : {n_neg:,}")
-    except subprocess.CalledProcessError as e:
-        print(f"  ERROR: bedtools failed:\n{e.stderr}")
-        sys.exit(1)
-    except FileNotFoundError:
-        print("  ERROR: bedtools not found. Install with: sudo apt install bedtools")
-        sys.exit(1)
+        for i, chrom in enumerate(sorted(peak_lines)):
+            if chrom not in chrom_sizes or chrom not in gene_lines:
+                skipped.append(chrom)
+                continue
+            genome_file.write_text(f"{chrom}\t{chrom_sizes[chrom]}\n")
+            chrom_peaks.write_text("".join(peak_lines[chrom]))
+            chrom_genes.write_text("".join(gene_lines[chrom]))
+            cmd = [
+                "bedtools", "shuffle",
+                "-i", str(chrom_peaks),
+                "-g", str(genome_file),
+                "-incl", str(chrom_genes),
+                "-excl", str(peaks_bed),
+                "-noOverlapping",
+                "-maxTries", "1000",
+                "-seed", str(RANDOM_STATE + i),
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            except subprocess.CalledProcessError as e:
+                sys.exit(f"ERROR: bedtools shuffle failed on {chrom}:\n{e.stderr}")
+            except FileNotFoundError:
+                sys.exit("ERROR: bedtools not found. Install with: sudo apt install bedtools")
+            outputs.append(result.stdout)
+    finally:
+        chrom_peaks.unlink(missing_ok=True)
+        chrom_genes.unlink(missing_ok=True)
 
+    if skipped:
+        print(f"  WARNING: no gene intervals / size for {skipped}; no negatives generated there")
+    with open(neg_bed_out, "w") as f:
+        f.write("".join(outputs))
+    n_neg = sum(len([l for l in o.splitlines() if l.strip()]) for o in outputs)
+    print(f"  Negatives generated : {n_neg:,} (length- and chromosome-matched)")
     return neg_bed_out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 — EXTRACT SEQUENCES FROM GRCh38
+# STEP 3 — EXTRACT STRAND-AWARE SEQUENCES
 # ─────────────────────────────────────────────────────────────────────────────
 
+_COMPLEMENT = str.maketrans("ACGTN", "TGCAN")
+
+
 def clean_seq(seq: str) -> str:
-    return re.sub(r"[^ACGT]", "", seq.upper().replace("U", "T"))
+    """Uppercase, U->T, and replace any non-ACGT character with N (keeps positions intact)."""
+    return re.sub(r"[^ACGTN]", "N", seq.upper().replace("U", "T"))
 
 
-def extract_via_samtools(bed_path: Path, out_fasta: Path) -> bool:
-    regions, tmp = [], out_fasta.parent / "_regions_tmp.txt"
-    with open(bed_path) as f:
-        for line in f:
-            cols = line.strip().split("\t")
-            if len(cols) >= 3:
-                regions.append(f"{cols[0]}:{int(cols[1])+1}-{cols[2]}")
-    with open(tmp, "w") as f:
-        f.write("\n".join(regions) + "\n")
+def revcomp(seq: str) -> str:
+    return seq.translate(_COMPLEMENT)[::-1]
+
+
+def region_key(chrom: str, start: int, end: int) -> str:
+    """samtools-style 1-based inclusive region for a 0-based half-open BED interval."""
+    return f"{chrom}:{start + 1}-{end}"
+
+
+def fetch_via_samtools(regions: pd.DataFrame, tmp_dir: Path) -> Optional[Dict[str, str]]:
+    """Fetch + strand sequences for each region. Returns {region_key: seq} or None if unavailable."""
+    fai = ensure_fai()
+    if fai is None:
+        return None
+    available = set(read_fai_sizes(fai))
+    keys = sorted({region_key(r.chrom, r.start, r.end)
+                   for r in regions.itertuples() if r.chrom in available})
+    tmp = tmp_dir / "_regions_tmp.txt"
+    tmp.write_text("\n".join(keys) + "\n")
     try:
-        result = subprocess.run(
-            ["samtools", "faidx", str(GENOME_FA), "-r", str(tmp)],
-            capture_output=True, text=True, check=True)
-        with open(out_fasta, "w") as f:
-            f.write(result.stdout)
+        result = subprocess.run(["samtools", "faidx", str(GENOME_FA), "-r", str(tmp)],
+                                capture_output=True, text=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    finally:
         tmp.unlink(missing_ok=True)
-        return True
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        return False
+
+    seqs, key, buf = {}, None, []
+    for line in result.stdout.splitlines():
+        if line.startswith(">"):
+            if key is not None:
+                seqs[key] = "".join(buf)
+            key, buf = line[1:].split()[0], []
+        else:
+            buf.append(line.strip())
+    if key is not None:
+        seqs[key] = "".join(buf)
+    return seqs
 
 
-def load_genome_into_memory() -> Dict[str, str]:
-    print("  Loading genome into memory (~2-3 min)...")
-    seqs, hdr, buf = {}, None, []
+def fetch_in_memory(regions: pd.DataFrame) -> Dict[str, str]:
+    print("  Loading genome into memory (~2-3 min for GRCh38)...")
+    wanted = set(regions["chrom"])
+    genome, hdr, buf = {}, None, []
     with open(GENOME_FA) as f:
         for line in f:
             line = line.strip()
             if line.startswith(">"):
-                if hdr: seqs[hdr] = "".join(buf)
+                if hdr in wanted:
+                    genome[hdr] = "".join(buf)
                 hdr, buf = line[1:].split()[0], []
-            else:
-                buf.append(line.upper())
-    if hdr: seqs[hdr] = "".join(buf)
-    return seqs
-
-
-def extract_from_bed_with_genome(bed_path: Path, out_fasta: Path, genome: Dict):
-    with open(out_fasta, "w") as f:
-        with open(bed_path) as b:
-            for line in b:
-                cols = line.strip().split("\t")
-                if len(cols) < 3: continue
-                chrom, start, end = cols[0], int(cols[1]), int(cols[2])
-                if chrom in genome:
-                    seq = clean_seq(genome[chrom][start:end])
-                    if seq:
-                        f.write(f">{chrom}:{start}-{end}\n{seq}\n")
-
-
-def read_fasta_with_coords(path: Path) -> Tuple[List[str], List[str]]:
-    """Returns (sequences, chromosomes)."""
-    seqs, chroms, buf, chrom = [], [], [], None
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line: continue
-            if line.startswith(">"):
-                if buf and chrom:
-                    seqs.append(clean_seq("".join(buf)))
-                    chroms.append(chrom)
-                m = re.search(r'(chr[^\s:()]+)', line)
-                chrom, buf = (m.group(1) if m else "unknown"), []
-            else:
+            elif hdr in wanted:
                 buf.append(line)
-    if buf and chrom:
-        seqs.append(clean_seq("".join(buf)))
-        chroms.append(chrom)
-    return seqs, chroms
+    if hdr in wanted:
+        genome[hdr] = "".join(buf)
+    return {region_key(r.chrom, r.start, r.end): genome[r.chrom][r.start:r.end]
+            for r in regions.itertuples() if r.chrom in genome}
 
 
-def extract_all_sequences(peaks_df: pd.DataFrame, neg_bed: Path,
-                          out_dir: Path) -> Tuple[List, List, List, List]:
-    print("\n[3/8] Extracting sequences from GRCh38...")
+def attach_sequences(df: pd.DataFrame, fetched: Dict[str, str],
+                     id_col: str, out_fasta: Path) -> pd.DataFrame:
+    """
+    Add a 'sequence' column (RNA-sense: reverse-complemented for '-' strand),
+    keyed by coordinates so rows can never be misaligned. Drops rows whose
+    sequence could not be fetched or is mostly ambiguous bases.
+    """
+    seqs = []
+    for r in df.itertuples():
+        s = clean_seq(fetched.get(region_key(r.chrom, r.start, r.end), ""))
+        if r.strand == "-":
+            s = revcomp(s)
+        seqs.append(s)
+    out = df.copy()
+    out["sequence"] = seqs
+    n_frac = out["sequence"].map(lambda s: s.count("N") / len(s) if s else 1.0)
+    keep = n_frac <= MAX_N_FRACTION
+    dropped = int((~keep).sum())
+    if dropped:
+        print(f"  Dropped {dropped:,} regions (missing from genome or >{MAX_N_FRACTION:.0%} N)")
+    out = out[keep].reset_index(drop=True)
 
-    pos_fa = out_dir / "positives.fa"
-    neg_fa = out_dir / "negatives.fa"
+    with open(out_fasta, "w") as f:
+        for r in out.itertuples():
+            f.write(f">{getattr(r, id_col)}::{region_key(r.chrom, r.start, r.end)}({r.strand})\n"
+                    f"{r.sequence}\n")
+    return out
 
-    ok = extract_via_samtools(out_dir / "peaks_cleaned.bed", pos_fa)
-    if ok:
-        extract_via_samtools(neg_bed, neg_fa)
+
+def extract_all_sequences(pos_df: pd.DataFrame, neg_df: pd.DataFrame,
+                          out_dir: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    print("\n[3/8] Extracting strand-aware sequences...")
+    regions = pd.concat([pos_df[["chrom", "start", "end"]], neg_df[["chrom", "start", "end"]]])
+
+    fetched = fetch_via_samtools(regions, out_dir)
+    if fetched is not None:
         print("  Extracted via samtools (fast)")
     else:
         print("  samtools unavailable — falling back to in-memory genome")
-        genome = load_genome_into_memory()
-        print(f"  Genome loaded: {len(genome)} chromosomes")
-        extract_from_bed_with_genome(out_dir / "peaks_cleaned.bed", pos_fa, genome)
-        extract_from_bed_with_genome(neg_bed, neg_fa, genome)
+        fetched = fetch_in_memory(regions)
 
-    pos_seqs, pos_chroms = read_fasta_with_coords(pos_fa)
-    neg_seqs, neg_chroms = read_fasta_with_coords(neg_fa)
+    pos_df = attach_sequences(pos_df, fetched, "peak_id", out_dir / "positives.fa")
+    neg_df = attach_sequences(neg_df, fetched, "neg_id",  out_dir / "negatives.fa")
 
-    print(f"  Positive sequences  : {len(pos_seqs):,}")
-    print(f"  Negative sequences  : {len(neg_seqs):,}")
-    if pos_seqs:
-        lens = [len(s) for s in pos_seqs]
-        print(f"  Length range        : {min(lens)}–{max(lens)} bp  (median {int(np.median(lens))} bp)")
-
-    return pos_seqs, pos_chroms, neg_seqs, neg_chroms
+    print(f"  Positive sequences  : {len(pos_df):,}")
+    print(f"  Negative sequences  : {len(neg_df):,}")
+    if len(pos_df):
+        lens = pos_df["sequence"].str.len()
+        print(f"  Length range        : {lens.min()}–{lens.max()} bp  (median {int(lens.median())} bp)")
+        n_long = int((lens > MAX_LEN).sum())
+        if n_long:
+            print(f"  Note: {n_long:,} positives longer than --max-len {MAX_LEN} bp "
+                  "will be centre-cropped for the CNN")
+    if len(pos_df) == 0 or len(neg_df) == 0:
+        sys.exit("ERROR: no sequences extracted — check that the genome FASTA matches your BED (GRCh38, chr names).")
+    return pos_df, neg_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 4 — BUILD TRAIN / VAL / TEST SPLITS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_splits(pos_seqs, pos_chroms, neg_seqs, neg_chroms,
-                 test_chroms, val_chroms):
-    """
-    Split positives and negatives by chromosome into train/val/test.
-    Returns dicts with keys: train, val, test
-    Each value is a tuple (sequences, labels)
-    """
-    test_set  = set(test_chroms)
-    val_set   = set(val_chroms)
+def assign_split(chrom: str, test_set: set, val_set: set) -> str:
+    if chrom in test_set:
+        return "test"
+    if chrom in val_set:
+        return "val"
+    return "train"
 
-    def split(seqs, chroms, label):
-        tr, va, te = [], [], []
-        for s, c in zip(seqs, chroms):
-            if c in test_set:       te.append((s, label))
-            elif c in val_set:      va.append((s, label))
-            else:                   tr.append((s, label))
-        return tr, va, te
 
-    pos_tr, pos_va, pos_te = split(pos_seqs, pos_chroms, 1)
-    neg_tr, neg_va, neg_te = split(neg_seqs, neg_chroms, 0)
+def build_splits(pos_df: pd.DataFrame, neg_df: pd.DataFrame,
+                 test_chroms: List[str], val_chroms: List[str]):
+    """
+    Split positives and negatives by chromosome, then balance each split by downsampling.
+    Returns ({split: (seqs, labels)}, pos_df with 'split', neg_df with 'split').
+    """
+    test_set, val_set = set(test_chroms), set(val_chroms)
+    if test_set & val_set:
+        sys.exit(f"ERROR: chromosomes in both test and val sets: {sorted(test_set & val_set)}")
+
+    present = set(pos_df["chrom"])
+    for label, chroms in (("test", test_set), ("val", val_set)):
+        missing = sorted(chroms - present)
+        if missing:
+            print(f"  Note: {label} chromosomes with no peaks: {missing}")
+
+    pos_df = pos_df.copy()
+    neg_df = neg_df.copy()
+    pos_df["split"] = [assign_split(c, test_set, val_set) for c in pos_df["chrom"]]
+    neg_df["split"] = [assign_split(c, test_set, val_set) for c in neg_df["chrom"]]
 
     rng = random.Random(RANDOM_STATE)
-
-    def balance_and_shuffle(pos, neg):
+    data = {}
+    for split in ("train", "val", "test"):
+        pos = pos_df.loc[pos_df["split"] == split, "sequence"].tolist()
+        neg = neg_df.loc[neg_df["split"] == split, "sequence"].tolist()
         n = min(len(pos), len(neg))
         rng.shuffle(pos); rng.shuffle(neg)
-        combined = pos[:n] + neg[:n]
+        combined = [(s, 1) for s in pos[:n]] + [(s, 0) for s in neg[:n]]
         rng.shuffle(combined)
-        seqs   = [s for s, _ in combined]
-        labels = [l for _, l in combined]
-        return seqs, labels
+        data[split] = ([s for s, _ in combined], [l for _, l in combined])
+        print(f"  {split.capitalize():<5} set           : {2*n:,} sequences ({n:,} pos / {n:,} neg)")
 
-    train_seqs, train_labels = balance_and_shuffle(pos_tr, neg_tr)
-    val_seqs,   val_labels   = balance_and_shuffle(pos_va, neg_va)
-    test_seqs,  test_labels  = balance_and_shuffle(pos_te, neg_te)
-
-    print(f"  Train set           : {len(train_seqs):,} sequences "
-          f"({sum(train_labels):,} pos / {len(train_labels)-sum(train_labels):,} neg)")
-    print(f"  Val set             : {len(val_seqs):,} sequences")
-    print(f"  Test set            : {len(test_seqs):,} sequences")
-
-    if len(test_seqs) == 0:
-        print("\n  WARNING: No sequences found on test chromosomes.")
-        print(f"  Test chroms requested: {test_chroms}")
-        print(f"  Chroms in data: {sorted(set(pos_chroms))}")
-        print("  Consider changing --test-chroms to chroms present in your data.")
-        sys.exit(1)
-
-    return (train_seqs, train_labels), (val_seqs, val_labels), (test_seqs, test_labels)
+    for split, hint in (("test", "--test-chroms"), ("val", "--val-chroms"), ("train", "the split")):
+        if len(data[split][0]) == 0:
+            sys.exit(f"ERROR: {split} set is empty. Chromosomes in data: {sorted(present)}. "
+                     f"Adjust {hint} to chromosomes present in your data.")
+    return data, pos_df, neg_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -395,10 +616,18 @@ class RBP_CNN(nn.Module):
         return self.classifier(x).squeeze(1)
 
 
+def fit_length(seq: str, length: int) -> str:
+    """Centre-crop sequences longer than `length` (binding is usually near the peak centre)."""
+    if len(seq) <= length:
+        return seq
+    offset = (len(seq) - length) // 2
+    return seq[offset:offset + length]
+
+
 def one_hot(seq: str) -> np.ndarray:
-    mapping = {"A": 0, "C": 1, "G": 2, "T": 3}
+    mapping = {"A": 0, "C": 1, "G": 2, "T": 3}   # N stays all-zero
     arr = np.zeros((4, MAX_LEN), dtype=np.float32)
-    for i, b in enumerate(seq[:MAX_LEN]):
+    for i, b in enumerate(fit_length(seq, MAX_LEN)):
         if b in mapping:
             arr[mapping[b], i] = 1.0
     return arr
@@ -418,23 +647,23 @@ class SeqDataset(Dataset):
 
 
 def train_cnn(train_seqs, train_labels, val_seqs, val_labels,
-              out_dir: Path, name: str) -> RBP_CNN:
+              out_dir: Path, name: str, max_epochs: int = 30) -> RBP_CNN:
     print("  Training CNN...")
+    set_seed(RANDOM_STATE)
     model = RBP_CNN().to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.BCEWithLogitsLoss()
 
-    train_ds = SeqDataset(train_seqs, train_labels)
-    val_ds   = SeqDataset(val_seqs,   val_labels)
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False)
+    loader_gen   = torch.Generator().manual_seed(RANDOM_STATE)
+    train_loader = DataLoader(SeqDataset(train_seqs, train_labels), batch_size=64,
+                              shuffle=True, generator=loader_gen)
+    val_loader   = DataLoader(SeqDataset(val_seqs, val_labels), batch_size=64, shuffle=False)
 
     best_val_loss = float("inf")
     best_weights  = None
     patience, patience_count = 5, 0
 
-    for epoch in range(30):
-        # Train
+    for epoch in range(max_epochs):
         model.train()
         train_loss = 0
         for x, y in train_loader:
@@ -445,7 +674,6 @@ def train_cnn(train_seqs, train_labels, val_seqs, val_labels,
             optimizer.step()
             train_loss += loss.item()
 
-        # Validate
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -472,7 +700,6 @@ def train_cnn(train_seqs, train_labels, val_seqs, val_labels,
     if best_weights:
         model.load_state_dict(best_weights)
 
-    # Save weights
     weights_path = out_dir / f"{name}_cnn.pt"
     torch.save(model.state_dict(), weights_path)
     print(f"  CNN weights saved   : {weights_path}")
@@ -480,14 +707,12 @@ def train_cnn(train_seqs, train_labels, val_seqs, val_labels,
 
 
 def cnn_predict(model: RBP_CNN, seqs: List[str]) -> List[float]:
-    ds     = SeqDataset(seqs)
-    loader = DataLoader(ds, batch_size=64, shuffle=False)
+    loader = DataLoader(SeqDataset(seqs), batch_size=64, shuffle=False)
     model.eval()
     probs = []
     with torch.no_grad():
         for x in loader:
-            logits = model(x.to(DEVICE))
-            probs.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+            probs.extend(torch.sigmoid(model(x.to(DEVICE))).cpu().numpy().tolist())
     return probs
 
 
@@ -499,7 +724,8 @@ def seq_to_kmers(seq: str, ks=(2, 3)) -> str:
     seq = clean_seq(seq)
     tokens = []
     for k in ks:
-        tokens.extend(seq[i:i+k] for i in range(len(seq) - k + 1))
+        tokens.extend(kmer for kmer in (seq[i:i+k] for i in range(len(seq) - k + 1))
+                      if "N" not in kmer)
     return " ".join(tokens)
 
 
@@ -515,8 +741,7 @@ def train_lr(train_seqs, train_labels):
 
 
 def lr_predict(clf, vectorizer, seqs: List[str]) -> List[float]:
-    texts = [seq_to_kmers(s) for s in seqs]
-    X     = vectorizer.transform(texts)
+    X = vectorizer.transform([seq_to_kmers(s) for s in seqs])
     return clf.predict_proba(X)[:, 1].tolist()
 
 
@@ -524,26 +749,23 @@ def lr_predict(clf, vectorizer, seqs: List[str]) -> List[float]:
 # STEP 5 (combined) — TRAIN & EVALUATE MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_and_score(train_data, val_data, test_data, out_dir, name):
+def train_and_score(data, out_dir, name):
     print("\n[4/8] Training and evaluating models...")
 
-    train_seqs, train_labels = train_data
-    val_seqs,   val_labels   = val_data
-    test_seqs,  test_labels  = test_data
+    train_seqs, train_labels = data["train"]
+    val_seqs,   val_labels   = data["val"]
+    test_seqs,  test_labels  = data["test"]
 
-    # CNN
-    cnn   = train_cnn(train_seqs, train_labels, val_seqs, val_labels, out_dir, name)
+    cnn       = train_cnn(train_seqs, train_labels, val_seqs, val_labels, out_dir, name)
     cnn_probs = cnn_predict(cnn, test_seqs)
     cnn_auc   = roc_auc_score(test_labels, cnn_probs)
     print(f"  CNN  test AUC       : {cnn_auc:.4f}")
 
-    # LR
     clf, vec  = train_lr(train_seqs, train_labels)
     lr_probs  = lr_predict(clf, vec, test_seqs)
     lr_auc    = roc_auc_score(test_labels, lr_probs)
     print(f"  LR   test AUC       : {lr_auc:.4f}")
 
-    # Ensemble
     mean_probs = [(c + l) / 2 for c, l in zip(cnn_probs, lr_probs)]
     mean_auc   = roc_auc_score(test_labels, mean_probs)
     print(f"  Ensemble test AUC   : {mean_auc:.4f}")
@@ -575,7 +797,6 @@ def make_plots(results: dict, out_dir: Path, name: str):
     lr_probs   = np.array(results["lr_probs"])
     mean_probs = np.array(results["mean_probs"])
 
-    # ROC curve
     fig, ax = plt.subplots(figsize=(7, 6))
     for probs, auc, label, color in [
         (cnn_probs,  results["cnn_auc"],  "CNN",      "#2196F3"),
@@ -587,7 +808,7 @@ def make_plots(results: dict, out_dir: Path, name: str):
     ax.plot([0,1],[0,1],"k--",lw=1,alpha=0.5)
     ax.set_xlabel("False Positive Rate", fontsize=12)
     ax.set_ylabel("True Positive Rate",  fontsize=12)
-    ax.set_title(f"ROC Curve — {name}", fontsize=13)
+    ax.set_title(f"ROC Curve (held-out test chromosomes) — {name}", fontsize=12)
     ax.legend(loc="lower right", fontsize=11)
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -595,7 +816,6 @@ def make_plots(results: dict, out_dir: Path, name: str):
     plt.savefig(roc_path, dpi=150); plt.close()
     print(f"  ROC curve           : {roc_path}")
 
-    # Score distributions
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     for ax, probs, model_name in [
         (axes[0], cnn_probs, "CNN"),
@@ -607,7 +827,7 @@ def make_plots(results: dict, out_dir: Path, name: str):
                 label="Negative (shuffled)", density=True)
         ax.set_xlabel(f"{model_name} binding probability", fontsize=11)
         ax.set_ylabel("Density", fontsize=11)
-        ax.set_title(f"{model_name} score distribution — {name}", fontsize=11)
+        ax.set_title(f"{model_name} test-set scores — {name}", fontsize=11)
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -651,26 +871,19 @@ def annotate_peak(chrom, start, end, gtf):
     return "intronic", gene
 
 
-def annotate_regions(peaks_df: pd.DataFrame, out_dir: Path, skip: bool) -> pd.DataFrame:
+def annotate_regions(peaks_df: pd.DataFrame, skip: bool) -> pd.DataFrame:
     print("\n[6/8] Annotating genomic regions...")
-    if skip or not GTF_FILE.exists():
-        if skip:
-            print("  Skipped (--skip-annotation)")
-        else:
-            print(f"  GTF not found at {GTF_FILE} — skipping")
+    peaks_df = peaks_df.copy()
+    if skip or GTF_FILE is None:
+        print("  Skipped (--skip-annotation)" if skip else "  Skipped (no --gtf given)")
         peaks_df["region_type"] = "not_annotated"
         peaks_df["gene_name"]   = "."
         return peaks_df
 
     gtf = parse_gtf(GTF_FILE)
-    region_types, gene_names = [], []
-    for _, row in peaks_df.iterrows():
-        rt, gn = annotate_peak(row["chrom"], row["start"], row["end"], gtf)
-        region_types.append(rt)
-        gene_names.append(gn)
-
-    peaks_df["region_type"] = region_types
-    peaks_df["gene_name"]   = gene_names
+    annotations = [annotate_peak(r.chrom, r.start, r.end, gtf) for r in peaks_df.itertuples()]
+    peaks_df["region_type"] = [a[0] for a in annotations]
+    peaks_df["gene_name"]   = [a[1] for a in annotations]
 
     counts = peaks_df["region_type"].value_counts()
     print("  Region breakdown:")
@@ -683,41 +896,37 @@ def annotate_regions(peaks_df: pd.DataFrame, out_dir: Path, skip: bool) -> pd.Da
 # STEP 8 — SAVE CSV + WORD REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def save_csv(peaks_df, results, out_dir, name) -> pd.DataFrame:
+def save_csv(pos_df: pd.DataFrame, results: dict, out_dir: Path, name: str) -> pd.DataFrame:
+    """
+    Score every positive peak and record which split it came from. Only peaks with
+    split == 'test' were unseen during training; train/val scores are optimistic.
+    """
     print("\n[7/8] Saving predictions CSV...")
+    df = pos_df.copy()
+    seqs = df["sequence"].tolist()
+    df["seq_length"] = [len(s) for s in seqs]
+    df["cnn_prob"]   = cnn_predict(results["cnn_model"], seqs)
+    df["lr_prob"]    = lr_predict(results["lr_clf"], results["lr_vec"], seqs)
+    df["mean_prob"]  = (df["cnn_prob"] + df["lr_prob"]) / 2
+    df["seen_in_training"] = df["split"] != "test"   # val is used for early stopping
+    df["high_confidence"]  = (df["cnn_prob"] > 0.5) & (df["lr_prob"] > 0.5)
+    df = df.sort_values("mean_prob", ascending=False).reset_index(drop=True)
 
-    # Score ALL peaks (not just test set) for the CSV output
-    all_seqs = []
-    for _, row in peaks_df.iterrows():
-        # sequences already extracted to positives.fa — re-read inline
-        all_seqs.append("")  # placeholder; filled below
-
-    # Re-read pos sequences
-    pos_fa = out_dir / "positives.fa"
-    pos_seqs, _ = read_fasta_with_coords(pos_fa)
-
-    n = min(len(peaks_df), len(pos_seqs))
-    df = peaks_df.head(n).copy()
-    df["sequence"] = pos_seqs[:n]
-    df["seq_length"] = [len(s) for s in pos_seqs[:n]]
-
-    # Score all peaks with trained models
-    cnn_all  = cnn_predict(results["cnn_model"], pos_seqs[:n])
-    lr_all   = lr_predict(results["lr_clf"], results["lr_vec"], pos_seqs[:n])
-    mean_all = [(c+l)/2 for c,l in zip(cnn_all, lr_all)]
-
-    df["cnn_prob"]        = cnn_all
-    df["lr_prob"]         = lr_all
-    df["mean_prob"]       = mean_all
-    df["high_confidence"] = (df["cnn_prob"] > 0.5) & (df["lr_prob"] > 0.5)
-    df = df.sort_values("mean_prob", ascending=False)
+    first = ["peak_id", "chrom", "start", "end", "strand", "name", "split", "seen_in_training",
+             "cnn_prob", "lr_prob", "mean_prob", "high_confidence"]
+    cols = [c for c in first if c in df.columns] + \
+           [c for c in df.columns if c not in first and c != "sequence"] + ["sequence"]
+    df = df[cols]
 
     csv_path = out_dir / f"{name}_predictions.csv"
     df.to_csv(csv_path, index=False)
 
-    n_high = df["high_confidence"].sum()
+    test = df[df["split"] == "test"]
+    n_high = int(test["high_confidence"].sum())
     print(f"  CSV saved           : {csv_path}")
-    print(f"  High-confidence     : {n_high:,} / {len(df):,} ({100*n_high/len(df):.1f}%)")
+    print(f"  High-confidence     : {n_high:,} / {len(test):,} held-out test peaks "
+          f"({100*n_high/max(len(test),1):.1f}%)")
+    print("  Note: scores for train/val peaks (seen_in_training=True) are optimistic.")
     return df
 
 
@@ -734,41 +943,72 @@ def interpret_auc(auc: float) -> str:
 
 def generate_report(peaks_df, results, out_dir, name, test_chroms, val_chroms):
     print("\n[8/8] Generating Word report...")
+    js_str = json.dumps   # safely quote any text injected into the JavaScript
 
     cnn_auc  = results["cnn_auc"]
     lr_auc   = results["lr_auc"]
     mean_auc = results["mean_auc"]
-    n_high   = int(peaks_df["high_confidence"].sum()) if "high_confidence" in peaks_df.columns else 0
-    pct_high = 100 * n_high / len(peaks_df) if len(peaks_df) > 0 else 0
+    test_df  = peaks_df[peaks_df["split"] == "test"]
+    n_high   = int(test_df["high_confidence"].sum())
+    pct_high = 100 * n_high / len(test_df) if len(test_df) else 0
     interp   = interpret_auc(mean_auc)
+    region_counts = peaks_df["region_type"].value_counts().to_dict()
 
-    region_counts = peaks_df["region_type"].value_counts().to_dict() \
-        if "region_type" in peaks_df.columns else {}
-
-    top5 = peaks_df.head(5)
     top5_js = "".join(
         f"""new TableRow({{ children: [
-          cell("{row['chrom']}:{row['start']}-{row['end']}", 2800),
-          cell("{row.get('gene_name','.')}", 1600),
-          cell("{row.get('region_type','.')}", 1400),
-          cell("{row.get('cnn_prob',0):.4f}", 1000),
-          cell("{row.get('lr_prob',0):.4f}", 1000),
-          cell("{row.get('mean_prob',0):.4f}", 1000)
+          cell({js_str(f"{r.chrom}:{r.start}-{r.end}({r.strand})")}, 2800),
+          cell({js_str(str(r.gene_name))}, 1600),
+          cell({js_str(str(r.region_type))}, 1400),
+          cell({js_str(f"{r.cnn_prob:.4f}")}, 1000),
+          cell({js_str(f"{r.lr_prob:.4f}")}, 1000),
+          cell({js_str(f"{r.mean_prob:.4f}")}, 1000)
         ] }}),"""
-        for _, row in top5.iterrows()
+        for r in test_df.head(5).itertuples()
     )
-
     region_rows = "".join(
         f"""new TableRow({{ children: [
-          cell("{rt}", 3000), cell("{cnt}", 1500),
-          cell("{100*cnt/len(peaks_df):.1f}%", 1500)
+          cell({js_str(str(rt))}, 3000), cell({js_str(str(cnt))}, 1500),
+          cell({js_str(f"{100*cnt/len(peaks_df):.1f}%")}, 1500)
         ] }}),"""
         for rt, cnt in region_counts.items()
     )
 
+    def row(label, value):
+        return f"new TableRow({{ children: [cell({js_str(label)},3600), cell({js_str(value)},5760)] }}),"
+
+    summary_rows = "".join([
+        row("Protein", name),
+        row("Peaks with sequences", f"{len(peaks_df):,}"),
+        row("Held-out test peaks", f"{len(test_df):,}"),
+        row("High-confidence test peaks", f"{n_high:,} ({pct_high:.1f}%)"),
+        row("Test chromosomes", " ".join(test_chroms)),
+        row("Val chromosomes", " ".join(val_chroms)),
+        row("CNN AUC", f"{cnn_auc:.4f}"),
+        row("LR AUC", f"{lr_auc:.4f}"),
+        row("Ensemble AUC", f"{mean_auc:.4f}"),
+    ])
+
+    docx_module = SCRIPT_DIR / "node_modules" / "docx"
+    report_path = out_dir / f"{name}_report.docx"
+    methods = {
+        "input": f"eCLIP BED file for {name}; {len(peaks_df):,} peaks with usable sequence on GRCh38.",
+        "neg": ("Negative regions generated with bedtools shuffle, matched to each peak's length and "
+                f"chromosome, constrained to genic regions and excluding peak coordinates. Seed = {RANDOM_STATE}."),
+        "seq": ("Sequences extracted in the RNA sense: minus-strand peaks are reverse-complemented. "
+                f"Sequences with more than {MAX_N_FRACTION:.0%} ambiguous bases were removed."),
+        "split": (f"Chromosome-based split: validation ({' '.join(val_chroms)}), test ({' '.join(test_chroms)}), "
+                  "training on all remaining chromosomes. Positives and negatives balanced by downsampling within each split."),
+        "cnn": ("Conv1D(4->64, k=7) -> BN -> MaxPool(4) -> Conv1D(64->128, k=7) -> BN -> MaxPool(4) -> GlobalMaxPool "
+                "-> FC(128->64, ReLU, Dropout 0.3) -> FC(64->1). Adam (lr=1e-3), BCEWithLogitsLoss, early stopping on "
+                f"validation loss (patience=5), max 30 epochs. One-hot input of {MAX_LEN} bp (longer sequences centre-cropped)."),
+        "lr": "k-mer logistic regression with 2-mer and 3-mer counts (CountVectorizer fit on training data only). Max iterations = 1000.",
+        "eval": ("AUC computed on held-out test chromosomes only. Peak tables in this report show test-chromosome "
+                 "peaks only, because scores for training peaks are optimistic."),
+    }
+
     js = f"""
 const {{ Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
-         AlignmentType, HeadingLevel, BorderStyle, WidthType, ShadingType }} = require(require('path').join(__dirname, 'node_modules', 'docx'));
+         AlignmentType, HeadingLevel, BorderStyle, WidthType, ShadingType }} = require({js_str(str(docx_module))});
 const fs = require('fs');
 
 const border  = {{ style: BorderStyle.SINGLE, size: 1, color: "CCCCCC" }};
@@ -816,7 +1056,7 @@ const doc = new Document({{
     }} }},
     children: [
       new Paragraph({{ alignment: AlignmentType.CENTER, children: [
-        new TextRun({{ text: "RBP Binding Analysis: {name}", bold: true, size: 40, font: "Arial" }})
+        new TextRun({{ text: {js_str("RBP Binding Analysis: " + name)}, bold: true, size: 40, font: "Arial" }})
       ] }}),
       new Paragraph({{ alignment: AlignmentType.CENTER, children: [
         new TextRun({{ text: "Sequence-Based Binding Site Analysis Pipeline", size: 26, color: "555555", font: "Arial" }})
@@ -829,25 +1069,18 @@ const doc = new Document({{
         columnWidths: [3600, 5760],
         rows: [
           new TableRow({{ children: [hcell("Parameter",3600), hcell("Value",5760)] }}),
-          new TableRow({{ children: [cell("Protein",3600), cell("{name}",5760)] }}),
-          new TableRow({{ children: [cell("Total peaks",3600), cell("{len(peaks_df):,}",5760)] }}),
-          new TableRow({{ children: [cell("High-confidence peaks",3600), cell("{n_high:,} ({pct_high:.1f}%)",5760)] }}),
-          new TableRow({{ children: [cell("Test chromosomes",3600), cell("{' '.join(test_chroms)}",5760)] }}),
-          new TableRow({{ children: [cell("Val chromosomes",3600), cell("{' '.join(val_chroms)}",5760)] }}),
-          new TableRow({{ children: [cell("CNN AUC",3600), cell("{cnn_auc:.4f}",5760)] }}),
-          new TableRow({{ children: [cell("LR AUC",3600), cell("{lr_auc:.4f}",5760)] }}),
-          new TableRow({{ children: [cell("Ensemble AUC",3600), cell("{mean_auc:.4f}",5760)] }}),
+          {summary_rows}
         ]
       }}),
       spacer(),
 
       h1("2. Model Performance"),
-      para("{interp}"),
+      para({js_str(interp)}),
       spacer(),
       para("See figures/roc_curve.png for the ROC curve and figures/score_distributions.png for score distributions."),
       spacer(),
 
-      h1("3. Top 5 Peaks by Binding Probability"),
+      h1("3. Top 5 Held-Out Test Peaks by Binding Probability"),
       new Table({{
         width: {{ size: 9360, type: WidthType.DXA }},
         columnWidths: [2800, 1600, 1400, 1000, 1000, 1000],
@@ -873,59 +1106,74 @@ const doc = new Document({{
       spacer(),
 
       h1("5. Methods"),
-      h2("5.1 Input Data"),
-      para("eCLIP BED file for {name} containing {len(peaks_df):,} peaks on GRCh38."),
-      spacer(),
-      h2("5.2 Negative Region Generation"),
-      para("Matched negative regions generated using bedtools shuffle, constrained to genic regions and excluding peak coordinates. Seed = {RANDOM_STATE}."),
-      spacer(),
-      h2("5.3 Train/Val/Test Split"),
-      para("Chromosome-based split: training on all chromosomes except validation ({' '.join(val_chroms)}) and test ({' '.join(test_chroms)}) sets. Positive and negative sets balanced by downsampling to equal counts within each split."),
-      spacer(),
-      h2("5.4 CNN"),
-      para("Convolutional neural network. Architecture: Conv1D(4->64, k=7) -> BN -> MaxPool(4) -> Conv1D(64->128, k=7) -> BN -> MaxPool(4) -> GlobalMaxPool -> FC(128->64, ReLU, Dropout 0.3) -> FC(64->1). Trained with Adam (lr=1e-3), BCEWithLogitsLoss, early stopping (patience=5), max 30 epochs. Input: one-hot encoded sequences, max length {MAX_LEN} bp."),
-      spacer(),
-      h2("5.5 Logistic Regression"),
-      para("k-mer logistic regression with 2-mer and 3-mer features (CountVectorizer). Trained on the same chromosome-split training set. Max iterations = 1000."),
-      spacer(),
-      h2("5.6 Evaluation"),
-      para("AUC (Area Under ROC Curve) computed on held-out test chromosomes using scikit-learn roc_auc_score."),
+      h2("5.1 Input Data"), para({js_str(methods["input"])}), spacer(),
+      h2("5.2 Negative Region Generation"), para({js_str(methods["neg"])}), spacer(),
+      h2("5.3 Sequence Extraction"), para({js_str(methods["seq"])}), spacer(),
+      h2("5.4 Train/Val/Test Split"), para({js_str(methods["split"])}), spacer(),
+      h2("5.5 CNN"), para({js_str(methods["cnn"])}), spacer(),
+      h2("5.6 Logistic Regression"), para({js_str(methods["lr"])}), spacer(),
+      h2("5.7 Evaluation"), para({js_str(methods["eval"])}),
     ]
   }}]
 }});
 
 Packer.toBuffer(doc).then(buf => {{
-  fs.writeFileSync('{out_dir}/{name}_report.docx', buf);
+  fs.writeFileSync({js_str(str(report_path))}, buf);
   console.log('Report saved.');
 }}).catch(err => {{ console.error(err); process.exit(1); }});
 """
 
+    try:
+        check = subprocess.run(["node", "-e", f"require({js_str(str(docx_module))})"],
+                               capture_output=True)
+        if check.returncode != 0:
+            print("  Installing docx npm package...")
+            subprocess.run(["npm", "install", "--prefix", str(SCRIPT_DIR), "docx"],
+                           check=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"  Warning: could not set up Node.js 'docx' package ({e}); skipping Word report.")
+        print("  CSV and figures were still saved.")
+        return
+
     js_path = out_dir / "_report.js"
-    with open(js_path, "w") as f:
-        f.write(js)
-
-    # Install docx if needed
-    check = subprocess.run(["node", "-e", "require(require('path').join(__dirname, 'node_modules', 'docx'))"], capture_output=True)
-    if check.returncode != 0:
-        print("  Installing docx npm package...")
-        subprocess.run(["npm", "install", "--prefix", str(Path(__file__).parent), "docx"], check=True)
-
+    js_path.write_text(js)
     result = subprocess.run(["node", str(js_path)], capture_output=True, text=True)
     js_path.unlink(missing_ok=True)
 
     if result.returncode == 0:
-        print(f"  Word report saved   : {out_dir}/{name}_report.docx")
+        print(f"  Word report saved   : {report_path}")
     else:
         print(f"  Warning: Word report failed: {result.stderr[:300]}")
         print("  CSV and figures were still saved.")
+
+
+def save_run_info(args, out_dir: Path) -> None:
+    """Record the exact parameters and software versions used for this run."""
+    import sklearn
+    info = {
+        "arguments": vars(args),
+        "versions": {
+            "python": sys.version.split()[0],
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "torch": torch.__version__,
+            "scikit-learn": sklearn.__version__,
+        },
+        "max_len": MAX_LEN,
+        "seed": RANDOM_STATE,
+        "device": str(DEVICE),
+    }
+    (out_dir / "run_info.json").write_text(json.dumps(info, indent=2))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
+    configure(args)
+    set_seed(RANDOM_STATE)
     name = args.name
     bed_in = Path(args.input)
 
@@ -933,45 +1181,44 @@ def main():
     print(f"  RBP ANALYSIS PIPELINE")
     print(f"  Protein      : {name}")
     print(f"  Input        : {bed_in}")
+    print(f"  Genome       : {GENOME_FA}")
     print(f"  Test chroms  : {args.test_chroms}")
     print(f"  Val chroms   : {args.val_chroms}")
     print(f"  Device       : {DEVICE}")
     print("=" * 65)
 
     if not bed_in.exists():
-        print(f"ERROR: Input file not found: {bed_in}")
-        sys.exit(1)
+        sys.exit(f"ERROR: Input file not found: {bed_in}")
 
     out_dir = setup_output_dir(name, args.output_dir)
     print(f"  Output dir   : {out_dir}")
+    save_run_info(args, out_dir)
+    check_reference_naming()
 
-    # Steps
-    peaks_df = validate_bed(bed_in, out_dir)
+    peaks_df = validate_bed(bed_in, out_dir, args.min_log2fc, args.min_log10p)
 
     if args.negatives:
         neg_bed = Path(args.negatives)
         print(f"\n[2/8] Using provided negatives: {neg_bed}")
     else:
-        neg_bed = generate_negatives(peaks_df, out_dir, name)
+        neg_bed = generate_negatives(out_dir, name)
+    neg_df = read_bed(neg_bed, "neg")
 
-    pos_seqs, pos_chroms, neg_seqs, neg_chroms = extract_all_sequences(
-        peaks_df, neg_bed, out_dir)
+    pos_df, neg_df = extract_all_sequences(peaks_df, neg_df, out_dir)
 
     print("\n[3/8] Building chromosome splits...")
-    train_data, val_data, test_data = build_splits(
-        pos_seqs, pos_chroms, neg_seqs, neg_chroms,
-        args.test_chroms, args.val_chroms)
+    data, pos_df, neg_df = build_splits(pos_df, neg_df, args.test_chroms, args.val_chroms)
 
-    results = train_and_score(train_data, val_data, test_data, out_dir, name)
-
+    results = train_and_score(data, out_dir, name)
     make_plots(results, out_dir, name)
 
-    peaks_df = annotate_regions(peaks_df, out_dir, args.skip_annotation)
+    pos_df = annotate_regions(pos_df, args.skip_annotation)
+    pos_df = save_csv(pos_df, results, out_dir, name)
 
-    peaks_df = save_csv(peaks_df, results, out_dir, name)
-
-    generate_report(peaks_df, results, out_dir, name,
-                    args.test_chroms, args.val_chroms)
+    if args.skip_report:
+        print("\n[8/8] Word report skipped (--skip-report)")
+    else:
+        generate_report(pos_df, results, out_dir, name, args.test_chroms, args.val_chroms)
 
     print("\n" + "=" * 65)
     print("  DONE")
@@ -981,6 +1228,7 @@ def main():
     print(f"  Mean AUC : {results['mean_auc']:.4f}")
     print(f"\n  Results  : {out_dir}")
     print("=" * 65)
+    return results
 
 
 if __name__ == "__main__":
