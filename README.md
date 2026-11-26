@@ -5,10 +5,10 @@ A generalised pipeline for training and evaluating sequence-based binding models
 ## What it does
 
 1. Validates your eCLIP BED file (accepts `chr1` or `1` naming; optional ENCODE significance filters)
-2. Generates negatives matched to each peak's length and chromosome (bedtools shuffle, within genes)
+2. Generates negatives matched to each peak's length, chromosome and GC content (bedtools shuffle within genes, then closest-GC selection)
 3. Extracts sequences in the RNA sense (minus-strand peaks are reverse-complemented)
 4. Trains CNN and logistic regression models on a chromosome-based split
-5. Evaluates on held-out chromosomes and reports AUC
+5. Evaluates on held-out chromosomes and reports AUC alongside a GC-content-only baseline
 6. Annotates peaks as exonic/intronic/UTR/intergenic (if a GTF is given)
 7. Outputs predictions CSV, ROC curve, score plots, Word report and `run_info.json`
 
@@ -52,10 +52,17 @@ Useful options:
 | `--test-chroms` | `chr21 chr22 chrX` | Held-out test chromosomes |
 | `--val-chroms` | `chr19 chr20` | Validation chromosomes (early stopping) |
 | `--min-log2fc`, `--min-log10p` | off | Keep peaks with log2FC (col 7) / −log10 p (col 8) above threshold; ENCODE uses 3 and 3 |
+| `--negative-strategy` | `gc-matched` | `gc-matched`: draw several candidates per peak and keep the closest in GC. `shuffle`: one random length/chromosome-matched region, GC uncontrolled |
+| `--gc-candidates` | `10` | Candidates per peak for `gc-matched` |
+| `--window` | off | Resize every peak to a fixed width around its midpoint (e.g. `100`) |
 | `--max-len` | `126` | CNN input length; longer sequences are centre-cropped |
 | `--negatives` | — | Use a pre-computed negatives BED (then `--genes-bed` is not needed) |
 | `--seed` | `42` | Seed for negatives, splits and model training |
 | `--skip-annotation`, `--skip-report` | — | Skip GTF annotation / Word report |
+
+## Why GC matching and the GC baseline matter
+
+eCLIP peaks often sit in exons and UTRs, which are GC-richer than the introns that dominate randomly sampled genic background. With unmatched negatives, a model can score a high AUC simply by detecting GC content. Every run therefore prints the mean GC of positives and negatives and a **GC-only baseline AUC** (each test sequence scored by its GC fraction alone). A model is only learning something beyond composition to the extent that it beats this baseline.
 
 ## Interpreting the predictions CSV
 

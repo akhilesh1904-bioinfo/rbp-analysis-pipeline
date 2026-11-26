@@ -90,6 +90,15 @@ def parse_args(argv=None):
                    help="Keep peaks with log2 fold-enrichment (BED column 7) >= this. ENCODE uses 3.")
     p.add_argument("--min-log10p", type=float, default=None,
                    help="Keep peaks with -log10 p-value (BED column 8) >= this. ENCODE uses 3.")
+    p.add_argument("--negative-strategy", choices=["gc-matched", "shuffle"], default="gc-matched",
+                   help="gc-matched: for each peak pick the candidate region with the closest GC content "
+                        "(also length- and chromosome-matched). shuffle: one random length- and "
+                        "chromosome-matched region per peak, GC not controlled. (default: gc-matched)")
+    p.add_argument("--gc-candidates", type=int, default=10,
+                   help="Candidate regions drawn per peak for gc-matched negatives (default: 10)")
+    p.add_argument("--window", type=int, default=None,
+                   help="Resize every peak to a fixed window of this many bp, centred on the peak "
+                        "midpoint (e.g. 100). Default: use peak coordinates as given.")
     p.add_argument("--max-len", type=int, default=126,
                    help="CNN input length in bp; longer sequences are centre-cropped (default: 126)")
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
@@ -121,6 +130,10 @@ def configure(args) -> None:
 
     if args.max_len < 8:
         sys.exit("ERROR: --max-len must be at least 8")
+    if args.window is not None and args.window < 8:
+        sys.exit("ERROR: --window must be at least 8")
+    if args.gc_candidates < 1:
+        sys.exit("ERROR: --gc-candidates must be at least 1")
     MAX_LEN = args.max_len
     RANDOM_STATE = args.seed
 
@@ -222,9 +235,19 @@ def _to_float(value: str) -> Optional[float]:
         return None
 
 
+def apply_window(df: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Resize each interval to `window` bp centred on its midpoint (clipped at 0)."""
+    df = df.copy()
+    mid = (df["start"] + df["end"]) // 2
+    df["start"] = (mid - window // 2).clip(lower=0)
+    df["end"] = df["start"] + window
+    return df
+
+
 def validate_bed(bed_path: Path, out_dir: Path,
                  min_log2fc: Optional[float] = None,
-                 min_log10p: Optional[float] = None) -> pd.DataFrame:
+                 min_log10p: Optional[float] = None,
+                 window: Optional[int] = None) -> pd.DataFrame:
     print("\n[1/8] Validating BED file...")
     rows = []
     skipped = renamed = filtered = 0
@@ -274,6 +297,9 @@ def validate_bed(bed_path: Path, out_dir: Path,
                  "Expected tab-separated BED with chromosomes chr1-22/X/Y/M (or 1-22/X/Y/MT).")
 
     df = pd.DataFrame(rows)
+    if window is not None:
+        df["orig_start"], df["orig_end"] = df["start"], df["end"]
+        df = apply_window(df, window)
     before = len(df)
     # Same interval on opposite strands = two different RNA binding events, so keep strand in the key
     df = df.drop_duplicates(subset=["chrom", "start", "end", "strand"]).reset_index(drop=True)
@@ -286,6 +312,8 @@ def validate_bed(bed_path: Path, out_dir: Path,
         print(f"  Removed by filters  : {filtered:,} (log2FC >= {min_log2fc}, -log10p >= {min_log10p})")
     if renamed:
         print(f"  Chrom names fixed   : {renamed:,} (e.g. '1' -> 'chr1')")
+    if window is not None:
+        print(f"  Window              : every peak resized to {window} bp around its midpoint")
     print(f"  Duplicates removed  : {before - len(df):,}")
     print(f"  Chromosomes         : {sorted(df['chrom'].unique())}")
     print(f"  Peak length range   : {df['peak_length'].min()}–{df['peak_length'].max()} bp")
@@ -321,8 +349,9 @@ def read_bed(path: Path, id_prefix: str) -> pd.DataFrame:
             if end <= start or chrom not in VALID_CHROMS:
                 continue
             rows.append({"chrom": chrom, "start": start, "end": end,
+                         "source_peak": cols[3] if len(cols) > 3 else ".",
                          "strand": cols[5] if len(cols) > 5 and cols[5] in ("+", "-") else "."})
-    df = pd.DataFrame(rows, columns=["chrom", "start", "end", "strand"])
+    df = pd.DataFrame(rows, columns=["chrom", "start", "end", "source_peak", "strand"])
     df[f"{id_prefix}_id"] = [f"{id_prefix}_{i}" for i in range(len(df))]
     return df
 
@@ -341,8 +370,14 @@ GRCH38_SIZES = {
 }
 
 
-def generate_negatives(out_dir: Path, name: str) -> Path:
-    print("\n[2/8] Generating matched negative regions...")
+def generate_negatives(out_dir: Path, name: str, rounds: int = 1) -> Path:
+    """
+    Shuffle every peak `rounds` times (each round: one length- and chromosome-matched region
+    per peak). Column 4 of the output keeps the source peak_id, so rounds > 1 gives a
+    candidate pool for GC matching.
+    """
+    label = "candidate" if rounds > 1 else "matched negative"
+    print(f"\n[2/8] Generating {label} regions ({rounds} per peak)...")
 
     peaks_bed   = out_dir / "peaks_cleaned.bed"
     neg_bed_out = out_dir / f"{name}_negatives.bed"
@@ -380,23 +415,24 @@ def generate_negatives(out_dir: Path, name: str) -> Path:
             genome_file.write_text(f"{chrom}\t{chrom_sizes[chrom]}\n")
             chrom_peaks.write_text("".join(peak_lines[chrom]))
             chrom_genes.write_text("".join(gene_lines[chrom]))
-            cmd = [
-                "bedtools", "shuffle",
-                "-i", str(chrom_peaks),
-                "-g", str(genome_file),
-                "-incl", str(chrom_genes),
-                "-excl", str(peaks_bed),
-                "-noOverlapping",
-                "-maxTries", "1000",
-                "-seed", str(RANDOM_STATE + i),
-            ]
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            except subprocess.CalledProcessError as e:
-                sys.exit(f"ERROR: bedtools shuffle failed on {chrom}:\n{e.stderr}")
-            except FileNotFoundError:
-                sys.exit("ERROR: bedtools not found. Install with: sudo apt install bedtools")
-            outputs.append(result.stdout)
+            for r in range(rounds):
+                cmd = [
+                    "bedtools", "shuffle",
+                    "-i", str(chrom_peaks),
+                    "-g", str(genome_file),
+                    "-incl", str(chrom_genes),
+                    "-excl", str(peaks_bed),
+                    "-noOverlapping",
+                    "-maxTries", "1000",
+                    "-seed", str(RANDOM_STATE + 1000 * r + i),
+                ]
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                except subprocess.CalledProcessError as e:
+                    sys.exit(f"ERROR: bedtools shuffle failed on {chrom}:\n{e.stderr}")
+                except FileNotFoundError:
+                    sys.exit("ERROR: bedtools not found. Install with: sudo apt install bedtools")
+                outputs.append(result.stdout)
     finally:
         chrom_peaks.unlink(missing_ok=True)
         chrom_genes.unlink(missing_ok=True)
@@ -406,8 +442,48 @@ def generate_negatives(out_dir: Path, name: str) -> Path:
     with open(neg_bed_out, "w") as f:
         f.write("".join(outputs))
     n_neg = sum(len([l for l in o.splitlines() if l.strip()]) for o in outputs)
-    print(f"  Negatives generated : {n_neg:,} (length- and chromosome-matched)")
+    print(f"  Regions generated   : {n_neg:,} (length- and chromosome-matched)")
     return neg_bed_out
+
+
+def gc_fraction(seq: str) -> float:
+    acgt = sum(seq.count(b) for b in "ACGT")
+    return (seq.count("G") + seq.count("C")) / acgt if acgt else 0.0
+
+
+def select_gc_matched(pos_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each peak, keep the candidate (same length and chromosome, by construction) whose
+    GC content is closest to the peak's. Each genomic interval is used at most once.
+    """
+    pos_gc = pos_df.set_index("peak_id")["sequence"].map(gc_fraction)
+    cand = cand_df[cand_df["source_peak"].isin(pos_gc.index)].copy()
+    cand["gc"] = cand["sequence"].map(gc_fraction)
+    cand["gc_diff"] = (cand["gc"] - cand["source_peak"].map(pos_gc)).abs()
+    cand = cand.sort_values(["gc_diff", "neg_id"])
+
+    chosen, used_peaks, used_regions = [], set(), set()
+    for r in cand.itertuples():
+        key = (r.chrom, r.start, r.end)
+        if r.source_peak in used_peaks or key in used_regions:
+            continue
+        chosen.append(r.Index)
+        used_peaks.add(r.source_peak)
+        used_regions.add(key)
+
+    out = cand.loc[chosen].sort_values("neg_id").drop(columns=["gc", "gc_diff"]).reset_index(drop=True)
+    n_missing = len(pos_gc) - len(out)
+    if n_missing:
+        print(f"  Note: {n_missing:,} peaks had no usable GC-matched candidate")
+    return out
+
+
+def report_gc(pos_df: pd.DataFrame, neg_df: pd.DataFrame) -> Tuple[float, float]:
+    pos_gc = 100 * pos_df["sequence"].map(gc_fraction).mean()
+    neg_gc = 100 * neg_df["sequence"].map(gc_fraction).mean()
+    print(f"  Mean GC             : positives {pos_gc:.1f}%  |  negatives {neg_gc:.1f}%  "
+          f"(difference {pos_gc - neg_gc:+.1f} points)")
+    return pos_gc, neg_gc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -770,7 +846,14 @@ def train_and_score(data, out_dir, name):
     mean_auc   = roc_auc_score(test_labels, mean_probs)
     print(f"  Ensemble test AUC   : {mean_auc:.4f}")
 
+    # Baseline: how well does GC content alone separate the test set?
+    gc_scores = [gc_fraction(s) for s in test_seqs]
+    gc_auc    = roc_auc_score(test_labels, gc_scores)
+    print(f"  GC-only baseline AUC: {gc_auc:.4f}  (models should clearly beat this)")
+
     return {
+        "gc_auc":     gc_auc,
+        "gc_scores":  gc_scores,
         "cnn_auc":    cnn_auc,
         "lr_auc":     lr_auc,
         "mean_auc":   mean_auc,
@@ -805,6 +888,9 @@ def make_plots(results: dict, out_dir: Path, name: str):
     ]:
         fpr, tpr, _ = roc_curve(y, probs)
         ax.plot(fpr, tpr, color=color, lw=2, label=f"{label} (AUC = {auc:.3f})")
+    fpr, tpr, _ = roc_curve(y, results["gc_scores"])
+    ax.plot(fpr, tpr, color="#777777", lw=1.5, ls=":",
+            label=f"GC content only (AUC = {results['gc_auc']:.3f})")
     ax.plot([0,1],[0,1],"k--",lw=1,alpha=0.5)
     ax.set_xlabel("False Positive Rate", fontsize=12)
     ax.set_ylabel("True Positive Rate",  fontsize=12)
@@ -986,6 +1072,9 @@ def generate_report(peaks_df, results, out_dir, name, test_chroms, val_chroms):
         row("CNN AUC", f"{cnn_auc:.4f}"),
         row("LR AUC", f"{lr_auc:.4f}"),
         row("Ensemble AUC", f"{mean_auc:.4f}"),
+        row("GC-only baseline AUC", f"{results['gc_auc']:.4f}"),
+        row("Negative strategy", results.get("negative_strategy", "")),
+        row("Mean GC (pos / neg)", results.get("gc_summary", "")),
     ])
 
     docx_module = SCRIPT_DIR / "node_modules" / "docx"
@@ -993,7 +1082,10 @@ def generate_report(peaks_df, results, out_dir, name, test_chroms, val_chroms):
     methods = {
         "input": f"eCLIP BED file for {name}; {len(peaks_df):,} peaks with usable sequence on GRCh38.",
         "neg": ("Negative regions generated with bedtools shuffle, matched to each peak's length and "
-                f"chromosome, constrained to genic regions and excluding peak coordinates. Seed = {RANDOM_STATE}."),
+                f"chromosome, constrained to the inclusion BED and excluding peak coordinates. Seed = {RANDOM_STATE}. "
+                + ("For each peak, several candidates were drawn and the one with the closest GC content was kept. "
+                   if results.get("negative_strategy") == "gc-matched" else "GC content was not controlled. ")
+                + "A GC-content-only baseline is reported alongside the models."),
         "seq": ("Sequences extracted in the RNA sense: minus-strand peaks are reverse-complemented. "
                 f"Sequences with more than {MAX_N_FRACTION:.0%} ambiguous bases were removed."),
         "split": (f"Chromosome-based split: validation ({' '.join(val_chroms)}), test ({' '.join(test_chroms)}), "
@@ -1195,21 +1287,37 @@ def main(argv=None):
     save_run_info(args, out_dir)
     check_reference_naming()
 
-    peaks_df = validate_bed(bed_in, out_dir, args.min_log2fc, args.min_log10p)
+    peaks_df = validate_bed(bed_in, out_dir, args.min_log2fc, args.min_log10p, args.window)
 
     if args.negatives:
         neg_bed = Path(args.negatives)
+        strategy = "provided"
         print(f"\n[2/8] Using provided negatives: {neg_bed}")
     else:
-        neg_bed = generate_negatives(out_dir, name)
+        strategy = args.negative_strategy
+        rounds = args.gc_candidates if strategy == "gc-matched" else 1
+        neg_bed = generate_negatives(out_dir, name, rounds=rounds)
     neg_df = read_bed(neg_bed, "neg")
 
     pos_df, neg_df = extract_all_sequences(peaks_df, neg_df, out_dir)
+
+    if strategy == "gc-matched":
+        print(f"  Selecting GC-matched negatives from {len(neg_df):,} candidates...")
+        neg_df = select_gc_matched(pos_df, neg_df)
+        neg_df[["chrom", "start", "end", "source_peak"]].assign(score=0, strand=neg_df["strand"]) \
+            .to_csv(out_dir / f"{name}_negatives.bed", sep="\t", index=False, header=False)
+        with open(out_dir / "negatives.fa", "w") as f:
+            for r in neg_df.itertuples():
+                f.write(f">{r.neg_id}::{region_key(r.chrom, r.start, r.end)}({r.strand})\n{r.sequence}\n")
+        print(f"  GC-matched negatives: {len(neg_df):,}")
+    pos_gc, neg_gc = report_gc(pos_df, neg_df)
 
     print("\n[3/8] Building chromosome splits...")
     data, pos_df, neg_df = build_splits(pos_df, neg_df, args.test_chroms, args.val_chroms)
 
     results = train_and_score(data, out_dir, name)
+    results["negative_strategy"] = strategy
+    results["gc_summary"] = f"{pos_gc:.1f}% / {neg_gc:.1f}%"
     make_plots(results, out_dir, name)
 
     pos_df = annotate_regions(pos_df, args.skip_annotation)
@@ -1226,6 +1334,7 @@ def main(argv=None):
     print(f"  CNN  AUC : {results['cnn_auc']:.4f}")
     print(f"  LR   AUC : {results['lr_auc']:.4f}")
     print(f"  Mean AUC : {results['mean_auc']:.4f}")
+    print(f"  GC-only  : {results['gc_auc']:.4f}  (baseline)")
     print(f"\n  Results  : {out_dir}")
     print("=" * 65)
     return results
