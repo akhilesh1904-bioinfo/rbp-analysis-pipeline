@@ -33,7 +33,7 @@ NODE_DIR = Path(os.environ.get("RBP_PIPELINE_NODE_DIR", Path.home() / ".cache" /
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_plots(results: Dict[str, Any], out_dir: Path, name: str) -> None:
-    log.info("\n[5/8] Generating plots...")
+    log.info("\n[5/9] Generating plots...")
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(exist_ok=True)
     y = np.array(results["test_labels"])
@@ -142,7 +142,7 @@ def save_predictions(pos_df: pd.DataFrame, results: Dict[str, Any], cfg: Config,
     Score every positive peak and record which split it came from. Only peaks with
     split == 'test' were unseen during training; train/val scores are optimistic.
     """
-    log.info("\n[7/8] Saving predictions CSV...")
+    log.info("\n[7/9] Saving predictions CSV...")
     df = pos_df.copy()
     seqs = df["sequence"].tolist()
     df["seq_length"] = [len(s) for s in seqs]
@@ -173,10 +173,10 @@ def save_predictions(pos_df: pd.DataFrame, results: Dict[str, Any], cfg: Config,
 def save_metrics(results: Dict[str, Any], out_dir: Path, name: str) -> Path:
     """<name>_metrics.json (everything) and <name>_metrics.csv (one row per model x metric)."""
     keys = ("cnn_auc", "lr_auc", "mean_auc", "gc_auc", "negative_strategy", "gc_positive", "gc_negative",
-            "n_test", "seeds", "metrics", "comparisons", "seed_summary", "leakage")
+            "n_test", "seeds", "metrics", "comparisons", "seed_summary", "leakage", "interpretation")
     payload = {k: results[k] for k in keys if k in results}
     path = out_dir / f"{name}_metrics.json"
-    path.write_text(json.dumps(payload, indent=2))
+    path.write_text(json.dumps(payload, indent=2, default=_json_default))
 
     rows = []
     seeds = results.get("seed_summary") or {}
@@ -190,6 +190,16 @@ def save_metrics(results: Dict[str, Any], out_dir: Path, name: str) -> Path:
                          "seed_mean": sd.get("mean"), "seed_sd": sd.get("sd")})
     pd.DataFrame(rows).to_csv(out_dir / f"{name}_metrics.csv", index=False)
     return path
+
+
+def _json_default(o):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, (np.ndarray, Path)):
+        return o.tolist() if isinstance(o, np.ndarray) else str(o)
+    raise TypeError(f"Not JSON serialisable: {type(o).__name__}")
 
 
 def save_run_info(cfg: Config, out_dir: Path) -> None:
@@ -246,7 +256,7 @@ def _metric_rows(results: Dict[str, Any], row) -> list:
 
 
 def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: Config, out_dir: Path) -> None:
-    log.info("\n[8/8] Generating Word report...")
+    log.info("\n[9/9] Generating Word report...")
     js_str = json.dumps   # safely quote any text injected into the JavaScript
     name = cfg.name
     test_df = peaks_df[peaks_df["split"] == "test"]
@@ -304,7 +314,9 @@ def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: C
                 f"-> FC(128->64, ReLU, Dropout 0.3) -> FC(64->1). Adam (lr={cfg.model.learning_rate}), "
                 f"BCEWithLogitsLoss, early stopping on validation loss (patience={cfg.model.patience}), max "
                 f"{cfg.model.epochs} epochs. One-hot input of {cfg.model.max_len} bp (longer sequences centre-cropped)."),
-        "lr": "k-mer logistic regression with 2-mer and 3-mer counts (CountVectorizer fit on training data only).",
+        "lr": (f"k-mer logistic regression on {'/'.join(map(str, cfg.model.lr_kmers))}-mer counts "
+               "(CountVectorizer fit on training data only)."),
+        "interp": _interp_methods(cfg) if results.get("interpretation") else "Interpretation step not run.",
         "eval": ("Metrics computed on held-out test chromosomes only: ROC-AUC, PR-AUC (average precision), and "
                  f"precision, recall, F1, MCC and Brier score at threshold {cfg.evaluation.threshold}, with "
                  f"{cfg.evaluation.bootstrap} bootstrap resamples for 95% CIs"
@@ -321,6 +333,7 @@ def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: C
         docx=js_str(str(docx_module)), title=js_str("RBP Binding Analysis: " + name),
         summary_rows=summary_rows, interp=js_str(interpret_auc(results["mean_auc"])),
         top5=top5_js, region_rows=region_rows, out=js_str(str(report_path)),
+        interp_paras=_interp_paras(results.get("interpretation"), js_str),
         **{f"m_{k}": js_str(v) for k, v in methods.items()})
 
     try:
@@ -340,6 +353,62 @@ def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: C
         log.info(f"  Word report saved   : {report_path}")
     else:
         log.warning(f"  Warning: Word report failed: {result.stderr[:300]}")
+
+
+def _interp_paras(summary, js_str) -> str:
+    """JavaScript para(...) calls summarising the interpretation step for the Word report."""
+    if not summary:
+        return 'para("Interpretation step not run (steps.interpretation is false)."),'
+    lines = []
+    cnn = summary.get("cnn", {})
+    if cnn.get("status") == "ok":
+        lines.append(f"CNN ({summary['method'].upper()}, {cnn['n_sequences']} top held-out test peaks): most important "
+                     f"{cnn['kmer_size']}-mers {', '.join(cnn['top_kmers'][:8])}. Importance at the peak centre vs "
+                     f"flanks: {cnn['centre_vs_flank_importance']:.1f}x.")
+        if cnn.get("top_filters"):
+            lines.append("Most influential first-layer CNN filters: "
+                         + ", ".join(f"{f['consensus']} ({f['influence']:+.2f})" for f in cnn["top_filters"][:5]) + ".")
+    lr = summary.get("lr")
+    if lr:
+        lines.append(f"Logistic regression k-mers favouring binding: {', '.join(lr['top_positive'][:8])}; "
+                     f"disfavouring: {', '.join(lr['top_negative'][:8])}.")
+    known = summary.get("known_motifs") or []
+    if known:
+        lines.append("Known motifs, % positives vs % matched negatives (odds ratio, q): " + "; ".join(
+            f"{k['motif']} {100*k['frac_pos']:.1f}% vs {100*k['frac_neg']:.1f}% ({k['odds_ratio']:.2f}, {k['q_value']:.1e})"
+            for k in known) + ".")
+    st = summary.get("streme", {})
+    lines.append("STREME de novo motifs: " + (", ".join(f"{m['consensus']} (E = {m['evalue']:.1e})"
+                 for m in st["motifs"][:6]) if st.get("status") == "ok" and st.get("motifs")
+                 else st.get("status", "not run")) + ".")
+    tt = summary.get("tomtom", {})
+    if tt.get("status") == "ok":
+        lines.append(f"Tomtom best matches in {tt['database']}: " + (", ".join(
+            f"{m['query_consensus']} -> {m['target_name'] or m['target']} (q = {m['q_value']:.1e})"
+            for m in tt["matches"][:6]) or "none below the threshold") + ".")
+    en = summary.get("enrichment", {})
+    if en.get("status") == "ok":
+        lines.append(f"g:Profiler ({en['n_query']} bound genes vs {en['background']}): " + (", ".join(
+            f"{t['name']} ({t['source']}, p = {t['p_value']:.1e})" for t in en["top_terms"][:5])
+            or "no significant terms") + ".")
+    lines.append("Figures: interp_*.png. Tables: interpretation/ folder.")
+    return "".join(f"para({js_str(l)}), spacer()," for l in lines)
+
+
+def _interp_methods(cfg: Config) -> str:
+    it = cfg.interpretation
+    how = ("in-silico mutagenesis (each base mutated to the three alternatives; importance = mean drop in the "
+           "CNN logit)" if it.method == "ism" else "gradient x input saliency of the CNN logit")
+    return (f"CNN attributions by {how} on the {it.n_sequences} highest-scoring held-out test positives, aggregated "
+            f"by position relative to the peak centre and over {it.kmer_size}-mers. First-layer filters were "
+            "converted to position frequency matrices from windows activating above half the filter's maximum; "
+            "filter influence is the drop in mean logit when the filter is zeroed. LR coefficients were ranked "
+            "directly (they are conditional on overlapping k-mers). Known IUPAC motifs were tested for presence in "
+            "positives vs matched negatives (Fisher exact test, Benjamini-Hochberg). De novo motifs: STREME (MEME "
+            "Suite, RNA alphabet) on positives vs the matched negatives, compared with known motifs by Tomtom "
+            "(Pearson, q < 0.1). Gene-set enrichment: g:Profiler g:GOSt (g:SCS) of genes with peaks against "
+            + ("a user-supplied background gene list." if it.background_genes else
+               "genes overlapped by peaks or negatives." if it.background == "sampled" else "all annotated genes."))
 
 
 _REPORT_JS = """
@@ -387,14 +456,17 @@ const doc = new Document({{
       new Table({{ width: {{ size: 6000, type: WidthType.DXA }}, columnWidths: [3000, 1500, 1500],
         rows: [ new TableRow({{ children: [hcell("Region",3000), hcell("Count",1500), hcell("%",1500)] }}), {region_rows} ] }}),
       spacer(),
-      h1("5. Methods"),
-      h2("5.1 Input Data"), para({m_input}), spacer(),
-      h2("5.2 Negative Region Generation"), para({m_neg}), spacer(),
-      h2("5.3 Sequence Extraction"), para({m_seq}), spacer(),
-      h2("5.4 Train/Val/Test Split"), para({m_split}), spacer(),
-      h2("5.5 CNN"), para({m_cnn}), spacer(),
-      h2("5.6 Logistic Regression"), para({m_lr}), spacer(),
-      h2("5.7 Evaluation"), para({m_eval}),
+      h1("5. Biological Interpretation"), {interp_paras}
+      spacer(),
+      h1("6. Methods"),
+      h2("6.1 Input Data"), para({m_input}), spacer(),
+      h2("6.2 Negative Region Generation"), para({m_neg}), spacer(),
+      h2("6.3 Sequence Extraction"), para({m_seq}), spacer(),
+      h2("6.4 Train/Val/Test Split"), para({m_split}), spacer(),
+      h2("6.5 CNN"), para({m_cnn}), spacer(),
+      h2("6.6 Logistic Regression"), para({m_lr}), spacer(),
+      h2("6.7 Evaluation"), para({m_eval}), spacer(),
+      h2("6.8 Interpretation"), para({m_interp}),
     ] }}]
 }});
 Packer.toBuffer(doc).then(buf => {{ fs.writeFileSync({out}, buf); console.log('Report saved.'); }})

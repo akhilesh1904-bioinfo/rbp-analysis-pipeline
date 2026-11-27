@@ -29,7 +29,7 @@ def assign_split(chrom: str, test_set: set, val_set: set) -> str:
 def assign_splits(pos_df: pd.DataFrame, neg_df: pd.DataFrame, test_chroms: Sequence[str],
                   val_chroms: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Add a 'split' column (train / val / test) to positives and negatives by chromosome."""
-    log.info("\n[3/8] Building chromosome splits...")
+    log.info("\n[3/9] Building chromosome splits...")
     test_set, val_set = set(test_chroms), set(val_chroms)
     if test_set & val_set:
         raise PipelineError(f"Chromosomes in both test and val sets: {sorted(test_set & val_set)}")

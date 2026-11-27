@@ -21,7 +21,7 @@ MODELS = ("cnn", "lr", "ensemble")
 def _train_once(data: SplitData, cfg: Config, seed: int) -> Dict[str, Any]:
     test_seqs, _ = data["test"]
     cnn, history = train_cnn(data["train"], data["val"], cfg.model, seed)
-    clf, vec = train_lr(*data["train"], seed=seed)
+    clf, vec = train_lr(*data["train"], seed=seed, ks=cfg.model.lr_kmers)
     cnn_probs = cnn_predict(cnn, test_seqs, cfg.model.max_len)
     lr_probs = lr_predict(clf, vec, test_seqs)
     return {"cnn_model": cnn, "cnn_history": history, "lr_clf": clf, "lr_vec": vec,
@@ -30,7 +30,7 @@ def _train_once(data: SplitData, cfg: Config, seed: int) -> Dict[str, Any]:
 
 
 def train_and_score(data: SplitData, cfg: Config, out_dir: Path) -> Dict[str, Any]:
-    log.info("\n[4/8] Training and evaluating models...")
+    log.info("\n[4/9] Training and evaluating models...")
     test_seqs, labels = data["test"]
     ev = cfg.evaluation
     seeds = [cfg.seed + i for i in range(ev.n_seeds)]

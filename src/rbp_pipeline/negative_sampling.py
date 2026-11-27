@@ -24,7 +24,7 @@ def generate_candidates(peaks_bed: Path, genome: Genome, regions_bed: Path,
     shuffle one chromosome at a time instead.
     """
     label = "candidate" if rounds > 1 else "matched negative"
-    log.info(f"\n[2/8] Generating {label} regions ({rounds} per peak)...")
+    log.info(f"\n[2/9] Generating {label} regions ({rounds} per peak)...")
     work = out_bed.parent
 
     chrom_sizes = {c: s for c, s in genome.chrom_sizes().items() if c in VALID_CHROMS}

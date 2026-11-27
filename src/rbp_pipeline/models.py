@@ -122,11 +122,14 @@ def cnn_predict(model: RBP_CNN, seqs: Sequence[str], max_len: int, batch_size: i
     return probs
 
 
-def train_lr(seqs: Sequence[str], labels: Sequence[int], seed: int):
-    """k-mer (2,3) count logistic regression. The vectorizer is fit on training data only."""
+def train_lr(seqs: Sequence[str], labels: Sequence[int], seed: int, ks: Sequence[int] = (2, 3)):
+    """k-mer count logistic regression. The vectorizer is fit on training data only."""
     log.info("  Training LR...")
-    vectorizer = CountVectorizer()
-    X = vectorizer.fit_transform([seq_to_kmers(s) for s in seqs])
+    ks = tuple(ks)
+    # tokens are already upper-case k-mers; keep them as they are (and allow k=1)
+    vectorizer = CountVectorizer(lowercase=False, token_pattern=r"\S+")
+    vectorizer.rbp_ks = ks
+    X = vectorizer.fit_transform([seq_to_kmers(s, ks) for s in seqs])
     clf = LogisticRegression(max_iter=1000, random_state=seed)
     clf.fit(X, np.array(labels))
     log.info(f"  LR trained on {len(seqs):,} sequences")
@@ -134,5 +137,6 @@ def train_lr(seqs: Sequence[str], labels: Sequence[int], seed: int):
 
 
 def lr_predict(clf, vectorizer, seqs: Sequence[str]) -> List[float]:
-    X = vectorizer.transform([seq_to_kmers(s) for s in seqs])
+    ks = getattr(vectorizer, "rbp_ks", (2, 3))
+    X = vectorizer.transform([seq_to_kmers(s, ks) for s in seqs])
     return clf.predict_proba(X)[:, 1].tolist()

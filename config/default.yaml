@@ -37,12 +37,35 @@ model:
   learning_rate: 0.001
   dropout: 0.3
   weight_decay: 0.0              # e.g. 0.0001 to reduce overfitting (uses AdamW)
+  lr_kmers: [2, 3]               # k-mer sizes for logistic regression; [3, 4, 5] gives more readable k-mers
 
 evaluation:
   n_seeds: 1                     # e.g. 5: retrain with 5 seeds and report mean ± SD
   bootstrap: 1000                # resamples for 95% confidence intervals (0 = off)
   threshold: 0.5                 # cut-off for precision, recall, F1, MCC, confusion matrix
 
+interpretation:                  # what the models learned (held-out test positives only)
+  n_sequences: 500               # top-scoring test positives explained by the CNN
+  method: ism                    # ism (in-silico mutagenesis) | saliency (gradient x input, faster)
+  kmer_size: 5                   # CNN importance summed over k-mers of this size
+  top_kmers: 20
+  motifs: true                   # de novo motifs with STREME and Tomtom (MEME Suite); skipped if not installed
+  streme_nmotifs: 8
+  motif_db: null                 # MEME-format RNA motif database for Tomtom, e.g. Ray2013_rbp_Homo_sapiens.meme
+  known_motifs:                  # always checked for enrichment in positives vs negatives (IUPAC)
+    IGF2BP_GGAC: GGAC
+    IGF2BP_CAUH: CAUH
+    m6A_DRACH: DRACH
+    FUS_GGUG: GGUG
+    TDP43_UGUGUG: UGUGUG
+    AU_rich_AUUUA: AUUUA
+  enrichment: false              # g:Profiler GO/KEGG/Reactome enrichment (needs internet and reference.gtf)
+  organism: hsapiens
+  enrichment_sources: [GO:BP, GO:MF, GO:CC, KEGG, REAC]
+  background: sampled            # sampled: genes overlapping peaks or negatives | annotated: all genes
+  background_genes: null         # better: a list of genes expressed in the cell line (one symbol per line)
+
 steps:
   annotation: true               # needs reference.gtf
+  interpretation: true
   report: true                   # Word report (needs Node.js)

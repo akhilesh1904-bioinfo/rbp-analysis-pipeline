@@ -24,3 +24,11 @@ split:
 evaluation:
   n_seeds: 5
   bootstrap: 1000
+
+model:
+  lr_kmers: [3, 4, 5]                    # readable LR k-mers (GGAC is a 4-mer)
+
+interpretation:
+  n_sequences: 500
+  motif_db: null                         # e.g. ~/ref/motif_databases/RNA/Ray2013_rbp_Homo_sapiens.meme
+  enrichment: true                       # needs internet

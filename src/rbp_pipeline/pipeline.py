@@ -71,7 +71,7 @@ def run(cfg: Config) -> Dict[str, Any]:
     neg_bed = out_dir / f"{cfg.name}_negatives.bed"
     if cfg.negatives.bed:
         strategy = "provided"
-        log.info(f"\n[2/8] Using provided negatives: {cfg.negatives.bed}")
+        log.info(f"\n[2/9] Using provided negatives: {cfg.negatives.bed}")
         neg_df = read_bed(Path(cfg.negatives.bed), "neg")
     else:
         strategy = cfg.negatives.strategy
@@ -101,7 +101,7 @@ def run(cfg: Config) -> Dict[str, Any]:
 
     # 5-8. Outputs
     make_plots(results, out_dir, cfg.name)
-    log.info("\n[6/8] Annotating genomic regions...")
+    log.info("\n[6/9] Annotating genomic regions...")
     if not cfg.steps.annotation:
         pos_df = skip_annotation(pos_df, "steps.annotation is false")
     elif not cfg.reference.gtf:
@@ -110,12 +110,17 @@ def run(cfg: Config) -> Dict[str, Any]:
         cache = Path(cfg.output_dir) / "_cache"
         pos_df = annotate_regions(pos_df, Path(cfg.reference.gtf), out_dir, cache)
     pos_df = save_predictions(pos_df, results, cfg, out_dir)
+    if cfg.steps.interpretation:
+        from .interpretation import run_interpretation
+        results["interpretation"] = run_interpretation(pos_df, neg_df, data, results, cfg, out_dir)
+    else:
+        log.info("\n[8/9] Interpretation skipped (steps.interpretation is false)")
     save_metrics(results, out_dir, cfg.name)
 
     if cfg.steps.report:
         generate_word_report(pos_df, results, cfg, out_dir)
     else:
-        log.info("\n[8/8] Word report skipped (steps.report is false)")
+        log.info("\n[9/9] Word report skipped (steps.report is false)")
 
     log.info("\n" + "=" * 65)
     log.info("  DONE")
