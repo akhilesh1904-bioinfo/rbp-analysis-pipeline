@@ -49,7 +49,7 @@ def write_fasta(df: pd.DataFrame, id_col: str, path: Path) -> None:
 
 def extract_sequences(pos_df: pd.DataFrame, neg_df: pd.DataFrame, genome: Genome,
                       out_dir: Path, max_len: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    log.info("\n[3/8] Extracting strand-aware sequences...")
+    log.info("\n[3/9] Extracting strand-aware sequences...")
     regions = pd.concat([pos_df[["chrom", "start", "end"]], neg_df[["chrom", "start", "end"]]])
     fetched = genome.fetch(regions, out_dir)
 

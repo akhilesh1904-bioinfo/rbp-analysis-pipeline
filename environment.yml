@@ -13,6 +13,7 @@ dependencies:
   - pyyaml
   - bedtools>=2.30
   - samtools>=1.15
+  - meme>=5.4           # STREME + Tomtom for motif discovery (optional)
   - nodejs              # for the Word report
   - pytest
   - pip

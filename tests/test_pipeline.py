@@ -57,6 +57,33 @@ def test_full_pipeline_from_config(synthetic_config, strategy):
     assert "DONE" in (out / "pipeline.log").read_text()
     assert (out / "figures" / "cnn_training_curve.png").exists()
 
+    # Interpretation: the CNN's most important k-mers and its top filters come from the planted motif
+    motif_rna = MOTIF.replace("T", "U")
+    s = results["interpretation"]
+    assert s["cnn"]["status"] == "ok"
+    assert all(k in motif_rna for k in s["cnn"]["top_kmers"][:3])
+    assert any(f["consensus"].upper()[1:6] in motif_rna for f in s["cnn"]["top_filters"][:3])
+    assert s["cnn"]["centre_vs_flank_importance"] > 3        # the motif sits at the peak centre
+    assert s["streme"]["status"].startswith(("ok", "skipped"))
+    idir = out / "interpretation"
+    for f in ("cnn_kmer_importance.csv", "cnn_position_importance.csv", "cnn_filter_motifs.csv",
+              "cnn_filter_motifs.meme", "cnn_importance.npz", "lr_kmer_coefficients.csv",
+              "known_motif_enrichment.csv", "interpretation_summary.json"):
+        assert (idir / f).exists(), f
+    npz = __import__("numpy").load(idir / "cnn_importance.npz")
+    assert set(npz["peak_id"]) <= set(csv.loc[csv.split == "test", "peak_id"])   # held-out peaks only
+    for fig in ("interp_position_importance", "interp_top_sequences", "interp_cnn_filters", "interp_cnn_kmers",
+                "interp_lr_kmers"):
+        assert (out / "figures" / f"{fig}.png").exists(), fig
+
+
+@needs_tools
+def test_interpretation_can_be_switched_off(synthetic_config):
+    cfg_path, d = synthetic_config
+    res = run(load_config(cfg_path, ["steps.interpretation=false", "model.epochs=2", "steps.annotation=false"]))
+    assert "interpretation" not in res
+    assert not (d["tmp"] / "results" / "SYN" / "interpretation").exists()
+
 
 @needs_tools
 def test_legacy_flags_give_same_result_as_config(synthetic_config):

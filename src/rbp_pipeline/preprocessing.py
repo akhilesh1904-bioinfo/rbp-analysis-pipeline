@@ -39,7 +39,7 @@ def validate_bed(bed_path: Path, out_dir: Path,
     Parse an ENCODE eCLIP BED, apply optional significance filters and windowing, and
     write `peaks_cleaned.bed` (name column = stable peak_id) to `out_dir`.
     """
-    log.info("\n[1/8] Validating BED file...")
+    log.info("\n[1/9] Validating BED file...")
     rows = []
     skipped = renamed = filtered = 0
     with open(bed_path) as f:

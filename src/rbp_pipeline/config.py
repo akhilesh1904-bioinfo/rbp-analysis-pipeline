@@ -54,6 +54,7 @@ class ModelConfig:
     learning_rate: float = 1e-3
     dropout: float = 0.3
     weight_decay: float = 0.0         # >0 switches the optimiser to AdamW
+    lr_kmers: List[int] = field(default_factory=lambda: [2, 3])   # k-mer sizes for logistic regression
 
 
 @dataclass
@@ -63,9 +64,39 @@ class EvaluationConfig:
     threshold: float = 0.5            # probability cut-off for precision/recall/F1/MCC
 
 
+# Well-characterised RBP sequence preferences (IUPAC, RNA alphabet), checked for enrichment in every run.
+# Replace or extend in the config; sources are in the README.
+DEFAULT_KNOWN_MOTIFS = {
+    "IGF2BP_GGAC": "GGAC",        # IGF2BP KH3-4 core (Biswas et al. 2019)
+    "IGF2BP_CAUH": "CAUH",        # IGF2BP PAR-CLIP motif (Hafner et al. 2010)
+    "m6A_DRACH": "DRACH",         # m6A consensus; IGF2BPs read m6A (Huang et al. 2018)
+    "FUS_GGUG": "GGUG",           # FUS (Lerga et al. 2001)
+    "TDP43_UGUGUG": "UGUGUG",     # TDP-43 UG repeats (Buratti & Baralle 2001)
+    "AU_rich_AUUUA": "AUUUA",     # ARE pentamer
+}
+
+
+@dataclass
+class InterpretationConfig:
+    n_sequences: int = 500            # top-scoring held-out test positives explained by the CNN
+    method: str = "ism"               # ism (in-silico mutagenesis) | saliency (gradient x input)
+    kmer_size: int = 5                # CNN importance is summed over k-mers of this size
+    top_kmers: int = 20               # rows in the CNN / LR k-mer tables
+    motifs: bool = True               # STREME + Tomtom (MEME Suite on PATH); skipped with a note otherwise
+    streme_nmotifs: int = 8
+    motif_db: Optional[str] = None    # MEME-format RNA motif database for Tomtom (e.g. Ray2013_rbp_Homo_sapiens.meme)
+    known_motifs: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_KNOWN_MOTIFS))
+    enrichment: bool = False          # g:Profiler gene-set enrichment (needs internet and reference.gtf)
+    organism: str = "hsapiens"
+    enrichment_sources: List[str] = field(default_factory=lambda: ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"])
+    background: str = "sampled"       # sampled (genes overlapping peaks or negatives) | annotated (all g:Profiler genes)
+    background_genes: Optional[str] = None   # gene-symbol list (one per line) used instead, e.g. expressed genes
+
+
 @dataclass
 class StepsConfig:
     annotation: bool = True
+    interpretation: bool = True
     report: bool = True
 
 
@@ -81,6 +112,7 @@ class Config:
     split: SplitConfig = field(default_factory=SplitConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
+    interpretation: InterpretationConfig = field(default_factory=InterpretationConfig)
     steps: StepsConfig = field(default_factory=StepsConfig)
 
     @property
@@ -94,7 +126,11 @@ class Config:
 NEGATIVE_STRATEGIES = ("gc-matched", "shuffle")
 LEAKAGE_MODES = ("report", "remove")
 ASSEMBLIES = ("GRCh38", "GRCh37", "any")
-INPUT_PATH_FIELDS = ("input", "reference.genome", "reference.genes_bed", "reference.gtf", "negatives.bed")
+ATTRIBUTION_METHODS = ("ism", "saliency")
+BACKGROUNDS = ("sampled", "annotated")
+IUPAC = set("ACGUTRYSWKMBDHVN")
+INPUT_PATH_FIELDS = ("input", "reference.genome", "reference.genes_bed", "reference.gtf", "negatives.bed",
+                     "interpretation.motif_db", "interpretation.background_genes")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,8 +311,34 @@ def validate(cfg: Config) -> None:
         problems.append("model.dropout must be between 0 and 1")
     if not isinstance(m.weight_decay, (int, float)) or m.weight_decay < 0:
         problems.append("model.weight_decay must be >= 0")
+    ks = m.lr_kmers
+    if not isinstance(ks, list) or not ks or not all(isinstance(k, int) and 1 <= k <= 8 for k in ks):
+        problems.append("model.lr_kmers must be a list of whole numbers between 1 and 8, e.g. [2, 3]")
     if not isinstance(cfg.seed, int):
         problems.append("seed must be a whole number")
+
+    it = cfg.interpretation
+    if it.method not in ATTRIBUTION_METHODS:
+        problems.append(f"interpretation.method must be one of {ATTRIBUTION_METHODS}, got '{it.method}'")
+    for key, lo, hi in (("n_sequences", 1, None), ("kmer_size", 3, 10), ("top_kmers", 1, None),
+                        ("streme_nmotifs", 1, None)):
+        v = getattr(it, key)
+        if not isinstance(v, int) or v < lo or (hi is not None and v > hi):
+            problems.append(f"interpretation.{key} must be a whole number >= {lo}" + (f" and <= {hi}" if hi else ""))
+    if it.motif_db:
+        need_file("interpretation.motif_db", it.motif_db)
+    if not isinstance(it.known_motifs, dict):
+        problems.append("interpretation.known_motifs must be a mapping of name: IUPAC motif")
+    else:
+        for k, v in it.known_motifs.items():
+            if not isinstance(v, str) or not v or set(v.upper()) - IUPAC:
+                problems.append(f"interpretation.known_motifs.{k} must be an IUPAC sequence (ACGU/T, RYSWKMBDHVN)")
+    if it.background not in BACKGROUNDS:
+        problems.append(f"interpretation.background must be one of {BACKGROUNDS}, got '{it.background}'")
+    if it.background_genes:
+        need_file("interpretation.background_genes", it.background_genes)
+    if not isinstance(it.enrichment_sources, list) or not it.enrichment_sources:
+        problems.append("interpretation.enrichment_sources must be a non-empty list, e.g. [GO:BP, REAC]")
 
     if problems:
         raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(problems))
@@ -322,13 +384,36 @@ model:
   learning_rate: 0.001
   dropout: 0.3
   weight_decay: 0.0              # e.g. 0.0001 to reduce overfitting (uses AdamW)
+  lr_kmers: [2, 3]               # k-mer sizes for logistic regression; [3, 4, 5] gives more readable k-mers
 
 evaluation:
   n_seeds: 1                     # e.g. 5: retrain with 5 seeds and report mean ± SD
   bootstrap: 1000                # resamples for 95% confidence intervals (0 = off)
   threshold: 0.5                 # cut-off for precision, recall, F1, MCC, confusion matrix
 
+interpretation:                  # what the models learned (held-out test positives only)
+  n_sequences: 500               # top-scoring test positives explained by the CNN
+  method: ism                    # ism (in-silico mutagenesis) | saliency (gradient x input, faster)
+  kmer_size: 5                   # CNN importance summed over k-mers of this size
+  top_kmers: 20
+  motifs: true                   # de novo motifs with STREME and Tomtom (MEME Suite); skipped if not installed
+  streme_nmotifs: 8
+  motif_db: null                 # MEME-format RNA motif database for Tomtom, e.g. Ray2013_rbp_Homo_sapiens.meme
+  known_motifs:                  # always checked for enrichment in positives vs negatives (IUPAC)
+    IGF2BP_GGAC: GGAC
+    IGF2BP_CAUH: CAUH
+    m6A_DRACH: DRACH
+    FUS_GGUG: GGUG
+    TDP43_UGUGUG: UGUGUG
+    AU_rich_AUUUA: AUUUA
+  enrichment: false              # g:Profiler GO/KEGG/Reactome enrichment (needs internet and reference.gtf)
+  organism: hsapiens
+  enrichment_sources: [GO:BP, GO:MF, GO:CC, KEGG, REAC]
+  background: sampled            # sampled: genes overlapping peaks or negatives | annotated: all genes
+  background_genes: null         # better: a list of genes expressed in the cell line (one symbol per line)
+
 steps:
   annotation: true               # needs reference.gtf
+  interpretation: true
   report: true                   # Word report (needs Node.js)
 """
