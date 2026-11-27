@@ -39,10 +39,17 @@ def test_full_pipeline_from_config(synthetic_config, strategy):
         assert r.sequence == (revcomp(seq) if r.strand == "-" else seq)
         assert MOTIF in r.sequence
 
-    # Strand-aware annotation from the mini GTF (GENEA is + strand on chr21:0-20000)
+    # Strand-aware annotation from the mini GTF (chr21:0-20000 has GENEA on + and GENE_chr21_M on -)
     chr21 = csv[(csv.chrom == "chr21") & (csv.end <= 20000)]
     assert set(chr21.loc[chr21.strand == "+", "region_type"]) <= {"UTR", "exonic", "intronic"}
-    assert set(chr21.loc[chr21.strand == "-", "region_type"]) == {"intergenic"}
+    assert set(chr21.loc[chr21.strand == "+", "gene_name"]) == {"GENEA"}
+    assert set(chr21.loc[chr21.strand == "-", "gene_name"]) == {"GENE_chr21_M"}
+
+    # Negatives are strand-aware: QC finds none antisense, and the QC table is written
+    qc = results["negatives_qc"]
+    assert qc["negatives"]["antisense"] == 0 and not any("antisense" in w for w in qc["warnings"])
+    assert qc["class_match"] is not None and qc["class_match"] < 0.95      # default: no region matching
+    assert (out / "negatives_qc.csv").exists()
 
     # Negatives are length- and chromosome-matched
     neg = pd.read_csv(out / "SYN_negatives.bed", sep="\t", header=None)
@@ -75,6 +82,54 @@ def test_full_pipeline_from_config(synthetic_config, strategy):
     for fig in ("interp_position_importance", "interp_top_sequences", "interp_cnn_filters", "interp_cnn_kmers",
                 "interp_lr_kmers"):
         assert (out / "figures" / f"{fig}.png").exists(), fig
+
+
+@needs_tools
+def test_region_matched_negatives_from_gtf(synthetic_config):
+    """negatives.source: gtf + match_region: each negative lies in the same region class as its peak."""
+    cfg_path, d = synthetic_config
+    res = run(load_config(cfg_path, ["negatives.source=gtf", "negatives.match_region=true", "model.epochs=2",
+                                     "steps.interpretation=false", "reference.genes_bed=null"]))
+    out = d["tmp"] / "results" / "SYN"
+    qc = res["negatives_qc"]
+    assert qc["class_match"] > 0.95 and qc["negatives"]["antisense"] == 0
+    assert qc["negatives"]["intergenic"] == 0                     # every negative is genic
+    # half the synthetic peaks lie outside the mini-GTF genes: QC says so instead of suggesting match_region
+    assert any("intergenic and can't be matched" in w for w in qc["warnings"])
+    log = (out / "pipeline.log").read_text()
+    assert "same strand, same region class" in log
+    neg = pd.read_csv(out / "SYN_negatives.bed", sep="\t", header=None, names=["c", "s", "e", "src", "x", "strand"])
+    assert set(neg["strand"]) == {"+", "-"}
+
+
+@needs_tools
+def test_unstranded_genes_bed_is_flagged_by_qc(synthetic_config):
+    """The old failure mode: unstranded regions -> antisense negatives -> QC warning."""
+    cfg_path, d = synthetic_config
+    unstranded = d["tmp"] / "genes_unstranded.bed"
+    unstranded.write_text("".join(f"{c}\t0\t40000\n" for c in ["chr1", "chr2", "chr3", "chr4", "chr19",
+                                                                 "chr20", "chr21", "chr22", "chrX"]))
+    gtf = d["tmp"] / "plus_only.gtf"      # genes on '+' only, so '-' negatives are antisense
+    gtf.write_text("".join(l for l in d["gtf"].read_text().splitlines(keepends=True) if "\t+\t" in l))
+    res = run(load_config(cfg_path, [f"reference.genes_bed={unstranded}", f"reference.gtf={gtf}",
+                                     "model.epochs=2", "steps.interpretation=false"]))
+    qc = res["negatives_qc"]
+    assert qc["negatives"]["antisense"] > 0.15
+    assert any("antisense" in w for w in qc["warnings"])
+    assert "no strand column" in (d["tmp"] / "results" / "SYN" / "pipeline.log").read_text()
+
+
+@needs_tools
+def test_make_regions_cli(synthetic_dataset, capsys):
+    from rbp_pipeline.cli import main
+    d = synthetic_dataset
+    assert main(["make-regions", "--gtf", str(d["gtf"]), "--out-dir", str(d["tmp"] / "regions")]) == 0
+    files = sorted(p.name for p in (d["tmp"] / "regions").glob("*.bed"))
+    assert files == ["mini.UTR.stranded.bed", "mini.exonic.stranded.bed", "mini.genic.stranded.bed",
+                     "mini.intronic.stranded.bed"]
+    rows = (d["tmp"] / "regions" / "mini.exonic.stranded.bed").read_text().splitlines()
+    assert "chr21\t999\t5000\texonic\t0\t+" in rows and "chr21\t12000\t20000\texonic\t0\t-" in rows
+    assert "genic" in capsys.readouterr().out
 
 
 @needs_tools

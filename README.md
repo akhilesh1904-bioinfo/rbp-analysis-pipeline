@@ -7,7 +7,7 @@ Train and evaluate sequence-based models of RNA-binding protein (RBP) binding fr
 For each protein the pipeline:
 
 1. Validates the eCLIP BED (accepts `chr1` or `1` naming; optional ENCODE significance filters; optional fixed-width window)
-2. Generates negatives matched to each peak's **length, chromosome and GC content**, drawn from a region set you choose (genes, exons or introns)
+2. Generates negatives matched to each peak's **length, chromosome, strand and GC content** (and optionally its **region class**: UTR, exonic or intronic), each lying entirely inside a region set you choose, then **checks** that negatives resemble positives in region and strand
 3. Extracts sequences in the **RNA sense** (minus-strand peaks are reverse-complemented)
 4. Trains a 1D CNN and a k-mer logistic regression on a **chromosome-held-out split**
 5. Evaluates on the test set with ROC-AUC, PR-AUC, precision, recall, F1, MCC, Brier score, confusion matrices and calibration, with **bootstrap 95% CIs**, **paired significance tests** (CNN vs LR vs a **GC-content-only baseline**) and optional **multi-seed** mean ± SD
@@ -35,6 +35,7 @@ Without conda: install `bedtools` and `samtools` with your package manager, then
 rbp-pipeline default-config > igf2bp2.yaml     # commented template
 # edit name, input and reference paths
 rbp-pipeline validate igf2bp2.yaml             # checks every setting and file before running
+rbp-pipeline make-regions --gtf genes.gtf --out-dir ~/ref   # optional: stranded UTR/exonic/intronic BEDs
 rbp-pipeline run igf2bp2.yaml
 ```
 
@@ -73,6 +74,7 @@ Results go to `<output_dir>/<name>/`:
 | `<name>_predictions.csv` | every peak with CNN/LR scores, `split`, `seen_in_training`, region and gene |
 | `<name>_metrics.json` / `.csv` | all test metrics with 95% CIs, paired model comparisons, seed mean ± SD, leakage summary |
 | `leakage_flags.csv` | val/test sequences resembling training sequences, with the reason |
+| `negatives_qc.csv` | region-class and antisense fractions of positives vs negatives |
 | `figures/` | ROC and precision-recall curves (with GC baseline), calibration, confusion matrices, score distributions, CNN training curve |
 | `interpretation/` | CNN position and k-mer importance, filter motifs (`.meme`), LR k-mer coefficients, known-motif enrichment, STREME motifs, Tomtom matches, g:Profiler results, `interpretation_summary.json` |
 | `figures/interp_*.png` | importance profile around the peak centre, per-base importance logos for top test peaks, CNN filter logos, top CNN and LR k-mers, STREME motif logos |
@@ -86,12 +88,36 @@ Only peaks with `split == test` were unseen during training. Scores for train/va
 
 eCLIP peaks often lie in exons and UTRs, which are GC-richer than the introns that dominate randomly sampled genic background. With unmatched negatives, a model can score a high AUC simply by detecting GC content. Every run prints the mean GC of positives and negatives and a GC-only baseline AUC. A model is learning something beyond composition only to the extent that it beats this baseline.
 
-Example (IGF2BP2, K562, 3,834 IDR peaks, held-out chr21/chr22/chrX):
+Example (IGF2BP2, K562, 3,834 IDR peaks, held-out chr21/chr22/chrX; v0.4 negatives, before strand matching, so provisional):
 
 | Negatives | GC-only AUC | CNN AUC | LR AUC |
 |---|---|---|---|
 | Random within genes | 0.815 | 0.893 | 0.850 |
 | GC-matched, exons only, 100 bp window | 0.509 | 0.794 | 0.756 |
+
+## Strand and region matching
+
+GC is not the only shortcut. Two more are checked and controlled:
+
+- **Strand.** Sequences are read on the peak's strand. If a negative region is placed on a gene on the other strand, its sequence is the reverse complement of a transcript, which a model can tell apart from real mRNA. With `negatives.strand_aware: true` (default) '+' peaks are only placed in '+' regions and '-' peaks in '-' regions. This needs a strand in column 6 of `reference.genes_bed`; an unstranded file (for example exons merged across strands) triggers a warning. Build stranded files once with:
+
+  ```bash
+  rbp-pipeline make-regions --gtf ~/ref/gencode.v49.primary_assembly.annotation.gtf --out-dir ~/ref
+  ```
+
+  or let the pipeline build them with `negatives.source: gtf`.
+- **Region class.** Peaks of mRNA-binding proteins are mostly UTR; exon-drawn negatives are mostly coding sequence. With `negatives.source: gtf` and `negatives.match_region: true`, each peak's negatives come from its own class (UTR, exonic = exon minus UTR, intronic = gene minus exons), on the same strand. Intergenic peaks draw from all chosen classes.
+- Every placement lies **entirely** inside a region (bedtools `shuffle -incl` alone only guarantees the start).
+- **QC.** With `reference.gtf` set, negatives are annotated like positives and the run prints both region breakdowns, the share of negatives antisense to a gene, the share in their peak's own class, and a warning when they differ (`negatives_qc.csv`, `negatives_qc` in the metrics JSON).
+
+```yaml
+negatives:
+  strategy: gc-matched
+  gc_candidates: 30
+  source: gtf
+  region_classes: [UTR, exonic]     # mRNA-binding protein; add intronic for intron binders
+  match_region: true
+```
 
 ## Recommended settings for reporting results
 
@@ -126,7 +152,7 @@ Notes:
 - **Use `model.lr_kmers: [3, 4, 5]`** if you want readable LR k-mers; the default `[2, 3]` keeps earlier results reproducible but cannot show 4-mers such as GGAC. LR coefficients are conditional on overlapping k-mers, so read them as candidates.
 - **Motif database for Tomtom:** download the MEME Suite motif databases (`motif_databases.12.*.tgz` from meme-suite.org) and set `interpretation.motif_db` to `motif_databases/RNA/Ray2013_rbp_Homo_sapiens.meme` (RNAcompete motifs for human RBPs; other files in `RNA/` work too).
 - **Known motifs** checked by default (edit `interpretation.known_motifs`): IGF2BP GGAC (Biswas et al. 2019, *Nat Commun*) and CAUH (Hafner et al. 2010, *Cell*), m6A DRACH (IGF2BPs read m6A; Huang et al. 2018, *Nat Cell Biol*), FUS GGUG (Lerga et al. 2001, *J Biol Chem*), TDP-43 UG repeats (Buratti & Baralle 2001, *J Biol Chem*), the AUUUA ARE pentamer.
-- **Enrichment background:** genes with eCLIP peaks are long and well expressed, so testing them against every annotated gene mostly recovers "expressed in this cell line". The default background is genes overlapped by any peak or negative region (the universe the peaks were sampled from). Best is a list of genes expressed in the eCLIP cell line (`interpretation.background_genes`, one symbol per line). g:Profiler needs internet access at run time; if the request fails the run continues and records the failure.
+- **Enrichment background:** genes with eCLIP peaks are long and well expressed, so testing them against every annotated gene mostly recovers "expressed in this cell line". The default background is genes overlapped by any peak or negative region (the universe the peaks were sampled from). Best is a list of genes expressed in the eCLIP cell line (`interpretation.background_genes`, one symbol per line). Query and background are restricted to protein-coding genes (`protein_coding_only`), the background is applied over annotated genes only (g:Profiler `custom_annotated`), and the run logs the effective background size g:Profiler used, warning if it is much larger than the list sent. g:Profiler needs internet access at run time; if the request fails the run continues and records the failure.
 - Attributions explain the model, not the biology directly: with GC-matched, region-matched negatives the features the CNN uses are candidates for sequence preference; with shuffled negatives they will largely reflect composition.
 
 ## Project structure
@@ -136,14 +162,14 @@ src/rbp_pipeline/
   config.py              YAML config, overrides, validation
   genome.py              chromosome naming, FASTA access, strand-aware fetching
   preprocessing.py       BED parsing, filters, windowing
-  negative_sampling.py   length/chromosome-matched candidates, GC matching
+  negative_sampling.py   length/chromosome/strand(/region)-matched candidates, GC matching, region QC
   sequence_extraction.py RNA-sense sequences, FASTA output
   dataset.py             chromosome splits, one-hot and k-mer encodings
   models.py              CNN and logistic regression
   training.py            training + test-set scoring
   evaluation.py          metrics, bootstrap CIs, paired comparisons, seed summaries
   leakage.py             exact / reverse-complement / shared k-mer overlap between splits
-  annotation.py          strand-aware UTR/exonic/intronic annotation (bedtools)
+  annotation.py          strand-aware UTR/exonic/intronic annotation, stranded region sets (bedtools)
   attribution.py         CNN ISM / saliency, k-mer and position aggregation, filter motifs, LR k-mers
   motifs.py              known-motif enrichment, MEME format, STREME and Tomtom wrappers
   enrichment.py          g:Profiler gene-set enrichment with an explicit background

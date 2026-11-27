@@ -4,6 +4,7 @@ Command line.
     rbp-pipeline run config.yaml [--set model.max_len=100 ...]
     rbp-pipeline default-config > my_protein.yaml
     rbp-pipeline validate config.yaml
+    rbp-pipeline make-regions --gtf gencode.gtf --out-dir ~/ref   # stranded UTR/exonic/intronic BEDs
 
 `run_rbp_analysis.py` (the original flag-based interface) still works via `legacy_main`.
 """
@@ -33,11 +34,18 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     sub.add_parser("default-config", help="Print a commented default config")
 
+    reg_p = sub.add_parser("make-regions", help="Write stranded UTR / exonic / intronic BEDs from a GTF "
+                                                "(for reference.genes_bed)")
+    reg_p.add_argument("--gtf", required=True, help="GENCODE / Ensembl GTF")
+    reg_p.add_argument("--out-dir", required=True, help="Folder for the BED files")
+
     args = p.parse_args(argv)
     try:
         if args.command == "default-config":
             sys.stdout.write(default_yaml())
             return 0
+        if args.command == "make-regions":
+            return make_regions(args.gtf, args.out_dir)
         cfg = load_config(args.config, args.overrides)
         if args.command == "validate":
             validate(cfg)
@@ -49,6 +57,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     except PipelineError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
+
+
+def make_regions(gtf: str, out_dir: str) -> int:
+    import logging
+    from pathlib import Path
+    from .annotation import REGION_CLASSES, region_beds_from_gtf
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    gtf_path, out = Path(gtf).expanduser(), Path(out_dir).expanduser()
+    if not gtf_path.is_file():
+        raise PipelineError(f"GTF not found: {gtf_path}")
+    out.mkdir(parents=True, exist_ok=True)
+    beds = region_beds_from_gtf(gtf_path, out / "_cache")
+    stem = gtf_path.name.removesuffix(".gz").removesuffix(".gtf")
+    written = {}
+    for cls in REGION_CLASSES:
+        dst = out / f"{stem}.{cls}.stranded.bed"
+        dst.write_text(beds[cls].read_text())
+        written[cls] = dst
+    genic = out / f"{stem}.genic.stranded.bed"
+    genic.write_text("".join(written[c].read_text() for c in REGION_CLASSES))
+    for cls, path in {**written, "all genic": genic}.items():
+        n = sum(1 for _ in open(path))
+        print(f"  {cls:<10} {n:>9,} regions  {path}")
+    print("\nUse one as reference.genes_bed (e.g. the exonic + UTR file for an mRNA-binding protein), "
+          "or set negatives.source: gtf to build them on the fly.")
+    return 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

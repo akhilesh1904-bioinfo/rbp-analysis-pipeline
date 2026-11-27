@@ -173,7 +173,7 @@ def save_predictions(pos_df: pd.DataFrame, results: Dict[str, Any], cfg: Config,
 def save_metrics(results: Dict[str, Any], out_dir: Path, name: str) -> Path:
     """<name>_metrics.json (everything) and <name>_metrics.csv (one row per model x metric)."""
     keys = ("cnn_auc", "lr_auc", "mean_auc", "gc_auc", "negative_strategy", "gc_positive", "gc_negative",
-            "n_test", "seeds", "metrics", "comparisons", "seed_summary", "leakage", "interpretation")
+            "n_test", "seeds", "metrics", "comparisons", "seed_summary", "leakage", "interpretation", "negatives_qc")
     payload = {k: results[k] for k in keys if k in results}
     path = out_dir / f"{name}_metrics.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default))
