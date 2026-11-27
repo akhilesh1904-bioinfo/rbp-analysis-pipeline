@@ -1,0 +1,20 @@
+# conda env create -f environment.yml && conda activate rbp-pipeline
+name: rbp-pipeline
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pytorch>=2.0        # CPU build from conda-forge; install a CUDA build separately if you have a GPU
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - pyyaml
+  - bedtools>=2.30
+  - samtools>=1.15
+  - nodejs              # for the Word report
+  - pytest
+  - pip
+  - pip:
+      - -e .
