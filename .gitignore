@@ -16,3 +16,6 @@ __pycache__/
 _regions_tmp.txt
 _report.js
 genome.txt
+_cache/
+*.egg-info/
+.pytest_cache/

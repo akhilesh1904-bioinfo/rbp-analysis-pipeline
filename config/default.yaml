@@ -1,0 +1,38 @@
+# rbp-pipeline configuration
+# Relative input paths are resolved against this file's folder.
+# Any value can be overridden on the command line, e.g. --set model.max_len=100
+
+name: MY_PROTEIN                 # used for the output folder and file names
+input: peaks.bed                 # ENCODE eCLIP peak BED (chr1 or 1 naming both accepted)
+output_dir: results              # results go to <output_dir>/<name>/ (relative to where you run)
+seed: 42
+
+reference:
+  genome: GRCh38.primary_assembly.genome.fa   # chr-prefixed FASTA (GENCODE/UCSC style)
+  genes_bed: genes_only.bed      # regions negatives are drawn from (genes, exons or introns)
+  gtf: null                      # optional GENCODE GTF for exonic/intronic/UTR annotation
+
+peaks:
+  min_log2fc: null               # keep peaks with log2 fold-enrichment (BED col 7) >= this; ENCODE uses 3
+  min_log10p: null               # keep peaks with -log10 p (BED col 8) >= this; ENCODE uses 3
+  window: 100                    # resize every peak to this width around its midpoint; null = as given
+
+negatives:
+  strategy: gc-matched           # gc-matched | shuffle
+  gc_candidates: 10              # candidate regions per peak for gc-matched
+  bed: null                      # pre-computed negatives BED (skips generation)
+
+split:
+  test_chroms: [chr21, chr22, chrX]
+  val_chroms: [chr19, chr20]
+
+model:
+  max_len: 126                   # CNN input length; longer sequences are centre-cropped
+  epochs: 30
+  patience: 5                    # early-stopping patience (epochs without val-loss improvement)
+  batch_size: 64
+  learning_rate: 0.001
+
+steps:
+  annotation: true               # needs reference.gtf
+  report: true                   # Word report (needs Node.js)

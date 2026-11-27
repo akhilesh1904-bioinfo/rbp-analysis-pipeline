@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rbp-pipeline"
+dynamic = ["version"]
+description = "Sequence-based RNA-binding protein binding-site analysis from ENCODE eCLIP peaks"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Akhilesh Naik" }]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21",
+    "pandas>=1.3",
+    "scikit-learn>=1.0",
+    "matplotlib>=3.4",
+    "torch>=1.12",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+rbp-pipeline = "rbp_pipeline.cli:main"
+
+[project.urls]
+Repository = "https://github.com/akhilesh1904-bioinfo/rbp-analysis-pipeline"
+
+[tool.setuptools.dynamic]
+version = { attr = "rbp_pipeline.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
