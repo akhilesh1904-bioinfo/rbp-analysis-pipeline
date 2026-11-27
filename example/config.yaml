@@ -1,7 +1,8 @@
-# Example config. Copy it, point the paths at your own files, then:
-#   rbp-pipeline run example/config.yaml
-name: IGF2BP2
-input: ~/ref/IGF2BP2_peaks.bed
+# Example config for a protein that binds mature mRNA (UTRs and exons).
+# Copy it, set the name and point the paths at your own files, then:
+#   rbp-pipeline run my_protein.yaml
+name: MY_PROTEIN                               # used for the output folder and file names
+input: ~/ref/MY_PROTEIN_peaks.bed              # ENCODE eCLIP IDR peaks (BED6+)
 output_dir: results
 
 reference:
@@ -18,7 +19,7 @@ negatives:
   strategy: gc-matched
   gc_candidates: 30
   source: gtf                            # stranded UTR / exonic regions built from the GTF
-  region_classes: [UTR, exonic]          # IGF2BP2 binds mature mRNA
+  region_classes: [UTR, exonic]          # mRNA binder; use [intronic] (or add it) for intron binders
   match_region: true                     # each peak's negatives from its own class, same strand
 
 split:
@@ -29,9 +30,11 @@ evaluation:
   bootstrap: 1000
 
 model:
-  lr_kmers: [3, 4, 5]                    # readable LR k-mers (GGAC is a 4-mer)
+  lr_kmers: [3, 4, 5]                    # readable LR k-mers, long enough for 4-5 nt motifs
 
 interpretation:
   n_sequences: 500
+  # known_motifs:                        # optional: motifs reported for your protein (name: IUPAC)
+  #   MY_MOTIF: UGCAUG
   motif_db: null                         # e.g. ~/ref/motif_databases/RNA/Ray2013_rbp_Homo_sapiens.meme
   enrichment: true                       # needs internet

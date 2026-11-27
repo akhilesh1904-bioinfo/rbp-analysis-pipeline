@@ -69,15 +69,16 @@ class EvaluationConfig:
     threshold: float = 0.5            # probability cut-off for precision/recall/F1/MCC
 
 
-# Well-characterised RBP sequence preferences (IUPAC, RNA alphabet), checked for enrichment in every run.
-# Replace or extend in the config; sources are in the README.
+# A small panel of RNA sequence elements frequently reported for RBPs (IUPAC, RNA alphabet), checked
+# for enrichment in every run as a sanity check. Replace or extend per protein in the config;
+# sources are in the README.
 DEFAULT_KNOWN_MOTIFS = {
-    "IGF2BP_GGAC": "GGAC",        # IGF2BP KH3-4 core (Biswas et al. 2019)
-    "IGF2BP_CAUH": "CAUH",        # IGF2BP PAR-CLIP motif (Hafner et al. 2010)
-    "m6A_DRACH": "DRACH",         # m6A consensus; IGF2BPs read m6A (Huang et al. 2018)
-    "FUS_GGUG": "GGUG",           # FUS (Lerga et al. 2001)
-    "TDP43_UGUGUG": "UGUGUG",     # TDP-43 UG repeats (Buratti & Baralle 2001)
-    "AU_rich_AUUUA": "AUUUA",     # ARE pentamer
+    "GGAC": "GGAC",               # Biswas et al. 2019
+    "CAUH": "CAUH",               # Hafner et al. 2010
+    "m6A_DRACH": "DRACH",         # m6A consensus (Huang et al. 2018)
+    "GGUG": "GGUG",               # Lerga et al. 2001
+    "UG_repeat": "UGUGUG",        # Buratti & Baralle 2001
+    "ARE_AUUUA": "AUUUA",         # AU-rich element pentamer
 }
 
 
@@ -425,13 +426,13 @@ interpretation:                  # what the models learned (held-out test positi
   motifs: true                   # de novo motifs with STREME and Tomtom (MEME Suite); skipped if not installed
   streme_nmotifs: 8
   motif_db: null                 # MEME-format RNA motif database for Tomtom, e.g. Ray2013_rbp_Homo_sapiens.meme
-  known_motifs:                  # always checked for enrichment in positives vs negatives (IUPAC)
-    IGF2BP_GGAC: GGAC
-    IGF2BP_CAUH: CAUH
+  known_motifs:                  # checked for enrichment in positives vs negatives (name: IUPAC); add your protein's
+    GGAC: GGAC
+    CAUH: CAUH
     m6A_DRACH: DRACH
-    FUS_GGUG: GGUG
-    TDP43_UGUGUG: UGUGUG
-    AU_rich_AUUUA: AUUUA
+    GGUG: GGUG
+    UG_repeat: UGUGUG
+    ARE_AUUUA: AUUUA
   enrichment: false              # g:Profiler GO/KEGG/Reactome enrichment (needs internet and reference.gtf)
   organism: hsapiens
   enrichment_sources: [GO:BP, GO:MF, GO:CC, KEGG, REAC]

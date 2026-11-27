@@ -32,17 +32,17 @@ Without conda: install `bedtools` and `samtools` with your package manager, then
 ## Quick start
 
 ```bash
-rbp-pipeline default-config > igf2bp2.yaml     # commented template
+rbp-pipeline default-config > my_protein.yaml     # commented template
 # edit name, input and reference paths
-rbp-pipeline validate igf2bp2.yaml             # checks every setting and file before running
+rbp-pipeline validate my_protein.yaml             # checks every setting and file before running
 rbp-pipeline make-regions --gtf genes.gtf --out-dir ~/ref   # optional: stranded UTR/exonic/intronic BEDs
-rbp-pipeline run igf2bp2.yaml
+rbp-pipeline run my_protein.yaml
 ```
 
 Any setting can be overridden for a single run:
 
 ```bash
-rbp-pipeline run igf2bp2.yaml --set negatives.strategy=shuffle --set name=IGF2BP2_shuffle
+rbp-pipeline run my_protein.yaml --set negatives.strategy=shuffle --set name=MY_PROTEIN_shuffle
 ```
 
 See [`example/config.yaml`](example/config.yaml) for a real configuration and [`config/default.yaml`](config/default.yaml) for every option.
@@ -55,15 +55,14 @@ See [`example/config.yaml`](example/config.yaml) for a real configuration and [`
 | Region BED for negatives | where negatives are drawn from | see below |
 | GTF (optional) | region annotation | GENCODE `gencode.v*.primary_assembly.annotation.gtf` |
 
-Choose the negative region set to match where your protein binds. Exon-binding proteins (e.g. IGF2BP2) need exon-only negatives; intron-binding proteins (e.g. FUS) need intron-only negatives:
+Choose the negative region set to match where your protein binds: proteins that bind mature mRNA need UTR/exon negatives, intron-binding proteins need intron negatives. The simplest option is to let the pipeline build stranded region sets from the GTF (`negatives.source: gtf`, see [Strand and region matching](#strand-and-region-matching)). To make reusable stranded BEDs for `reference.genes_bed` instead:
 
 ```bash
-GTF=gencode.v49.primary_assembly.annotation.gtf
-MAIN='$1 ~ /^chr([0-9]+|X|Y)$/'
-awk -F'\t' "$MAIN && \$3==\"gene\" {print \$1\"\t\"\$4-1\"\t\"\$5}" $GTF | sort -k1,1 -k2,2n | bedtools merge > genes.bed
-awk -F'\t' "$MAIN && \$3==\"exon\" {print \$1\"\t\"\$4-1\"\t\"\$5}" $GTF | sort -k1,1 -k2,2n | bedtools merge > exons.bed
-bedtools subtract -a genes.bed -b exons.bed > introns.bed
+rbp-pipeline make-regions --gtf gencode.v49.primary_assembly.annotation.gtf --out-dir ~/ref
+# writes *.UTR.stranded.bed, *.exonic.stranded.bed, *.intronic.stranded.bed and *.genic.stranded.bed
 ```
+
+Region BEDs need a strand in column 6; unstranded files (for example exons merged across strands) let negatives land antisense to genes and trigger a warning.
 
 ## Outputs
 
@@ -88,12 +87,7 @@ Only peaks with `split == test` were unseen during training. Scores for train/va
 
 eCLIP peaks often lie in exons and UTRs, which are GC-richer than the introns that dominate randomly sampled genic background. With unmatched negatives, a model can score a high AUC simply by detecting GC content. Every run prints the mean GC of positives and negatives and a GC-only baseline AUC. A model is learning something beyond composition only to the extent that it beats this baseline.
 
-Example (IGF2BP2, K562, 3,834 IDR peaks, held-out chr21/chr22/chrX; v0.4 negatives, before strand matching, so provisional):
-
-| Negatives | GC-only AUC | CNN AUC | LR AUC |
-|---|---|---|---|
-| Random within genes | 0.815 | 0.893 | 0.850 |
-| GC-matched, exons only, 100 bp window | 0.509 | 0.794 | 0.756 |
+In practice the difference is large: with negatives shuffled anywhere within genes, GC content alone can reach an AUC around 0.8 for exon- and UTR-binding proteins, so a model's headline AUC says little until it is compared with this baseline. With GC-, strand- and region-matched negatives the baseline falls to about 0.5, and whatever the models achieve above it is sequence signal.
 
 ## Strand and region matching
 
@@ -151,7 +145,7 @@ Notes:
 
 - **Use `model.lr_kmers: [3, 4, 5]`** if you want readable LR k-mers; the default `[2, 3]` keeps earlier results reproducible but cannot show 4-mers such as GGAC. LR coefficients are conditional on overlapping k-mers, so read them as candidates.
 - **Motif database for Tomtom:** download the MEME Suite motif databases (`motif_databases.12.*.tgz` from meme-suite.org) and set `interpretation.motif_db` to `motif_databases/RNA/Ray2013_rbp_Homo_sapiens.meme` (RNAcompete motifs for human RBPs; other files in `RNA/` work too).
-- **Known motifs** checked by default (edit `interpretation.known_motifs`): IGF2BP GGAC (Biswas et al. 2019, *Nat Commun*) and CAUH (Hafner et al. 2010, *Cell*), m6A DRACH (IGF2BPs read m6A; Huang et al. 2018, *Nat Cell Biol*), FUS GGUG (Lerga et al. 2001, *J Biol Chem*), TDP-43 UG repeats (Buratti & Baralle 2001, *J Biol Chem*), the AUUUA ARE pentamer.
+- **Known motifs** checked by default: a small panel of RNA sequence elements frequently reported for RBPs — GGAC (Biswas et al. 2019, *Nat Commun*), CAUH (Hafner et al. 2010, *Cell*), the m6A consensus DRACH (Huang et al. 2018, *Nat Cell Biol*), GGUG (Lerga et al. 2001, *J Biol Chem*), UG repeats (Buratti & Baralle 2001, *J Biol Chem*) and the AUUUA ARE pentamer. Replace or extend it per protein with `interpretation.known_motifs` (name: IUPAC sequence).
 - **Enrichment background:** genes with eCLIP peaks are long and well expressed, so testing them against every annotated gene mostly recovers "expressed in this cell line". The default background is genes overlapped by any peak or negative region (the universe the peaks were sampled from). Best is a list of genes expressed in the eCLIP cell line (`interpretation.background_genes`, one symbol per line). Query and background are restricted to protein-coding genes (`protein_coding_only`), the background is applied over annotated genes only (g:Profiler `custom_annotated`), and the run logs the effective background size g:Profiler used, warning if it is much larger than the list sent. g:Profiler needs internet access at run time; if the request fails the run continues and records the failure.
 - Attributions explain the model, not the biology directly: with GC-matched, region-matched negatives the features the CNN uses are candidates for sequence preference; with shuffled negatives they will largely reflect composition.
 

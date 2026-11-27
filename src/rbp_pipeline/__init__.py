@@ -1,6 +1,6 @@
 """Sequence-based RNA-binding protein (RBP) binding-site analysis from eCLIP peaks."""
 
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 
 class PipelineError(RuntimeError):

@@ -57,13 +57,13 @@ interpretation:                  # what the models learned (held-out test positi
   motifs: true                   # de novo motifs with STREME and Tomtom (MEME Suite); skipped if not installed
   streme_nmotifs: 8
   motif_db: null                 # MEME-format RNA motif database for Tomtom, e.g. Ray2013_rbp_Homo_sapiens.meme
-  known_motifs:                  # always checked for enrichment in positives vs negatives (IUPAC)
-    IGF2BP_GGAC: GGAC
-    IGF2BP_CAUH: CAUH
+  known_motifs:                  # checked for enrichment in positives vs negatives (name: IUPAC); add your protein's
+    GGAC: GGAC
+    CAUH: CAUH
     m6A_DRACH: DRACH
-    FUS_GGUG: GGUG
-    TDP43_UGUGUG: UGUGUG
-    AU_rich_AUUUA: AUUUA
+    GGUG: GGUG
+    UG_repeat: UGUGUG
+    ARE_AUUUA: AUUUA
   enrichment: false              # g:Profiler GO/KEGG/Reactome enrichment (needs internet and reference.gtf)
   organism: hsapiens
   enrichment_sources: [GO:BP, GO:MF, GO:CC, KEGG, REAC]
