@@ -6,7 +6,7 @@ output_dir: results
 
 reference:
   genome: ~/ref/GRCh38.primary_assembly.genome.fa
-  genes_bed: ~/ref/exons_merged.bed        # IGF2BP2 binds exons/UTRs -> exon-matched negatives
+  genes_bed: null                          # not needed with negatives.source: gtf
   gtf: ~/ref/gencode.v49.primary_assembly.annotation.gtf
 
 peaks:
@@ -17,6 +17,9 @@ peaks:
 negatives:
   strategy: gc-matched
   gc_candidates: 30
+  source: gtf                            # stranded UTR / exonic regions built from the GTF
+  region_classes: [UTR, exonic]          # IGF2BP2 binds mature mRNA
+  match_region: true                     # each peak's negatives from its own class, same strand
 
 split:
   leakage: report

@@ -305,12 +305,31 @@ def test_gprofiler_request_uses_custom_background(monkeypatch, tmp_path):
 
     out = enrichment.run_enrichment(["MYC", "IGF2", ".", "MYC"], ["ACTB", "GAPDH"], tmp_path,
                                     organism="hsapiens", sources=["GO:BP"])
-    assert sent["domain_scope"] == "custom" and sent["query"] == ["IGF2", "MYC"]
+    assert sent["domain_scope"] == "custom_annotated" and sent["query"] == ["IGF2", "MYC"]
     assert set(sent["background"]) == {"ACTB", "GAPDH", "IGF2", "MYC"}        # query added to background
     assert out["status"] == "ok" and out["n_terms"] == 1
     assert out["top_terms"][0]["name"] == "mRNA stability"
     assert pd.read_csv(tmp_path / "enrichment_gprofiler.csv").iloc[0]["native"] == "GO:1"
     assert (tmp_path / "enrichment_background_genes.txt").read_text().split() == ["ACTB", "GAPDH", "IGF2", "MYC"]
+
+
+def test_enrichment_restricts_to_protein_coding_and_checks_domain(monkeypatch, tmp_path):
+    sent = {}
+
+    def fake_urlopen(req, timeout=0):
+        sent.update(json.loads(req.data.decode()))
+        return _Resp(json.dumps({"result": [
+            {"source": "GO:BP", "native": "GO:1", "name": "x", "p_value": 1e-3, "term_size": 5, "query_size": 2,
+             "intersection_size": 2, "effective_domain_size": 20000, "precision": 1, "recall": 0.4}]}).encode())
+    monkeypatch.setattr(enrichment.urllib.request, "urlopen", fake_urlopen)
+    out = enrichment.run_enrichment(["MYC", "LINC1", "IGF2"], ["ACTB", "LINC2", "GAPDH"], tmp_path,
+                                    organism="hsapiens", sources=["GO:BP"],
+                                    restrict_to={"MYC", "IGF2", "ACTB", "GAPDH"})
+    assert sent["query"] == ["IGF2", "MYC"] and set(sent["background"]) == {"ACTB", "GAPDH", "IGF2", "MYC"}
+    assert out["effective_domain_size"] == 20000
+    assert out["warning"] and "may not have been applied" in out["warning"]   # 20,000 >> 4 sent
+    assert enrichment.background_warning(4, ["a"] * 4) is None
+    assert enrichment.background_warning(None, ["a"]) is None
 
 
 def test_gprofiler_failure_does_not_crash(monkeypatch, tmp_path):
@@ -332,6 +351,21 @@ def test_read_gene_file(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
+
+def test_negatives_config_validation(synthetic_config):
+    cfg_path, d = synthetic_config
+    validate(load_config(cfg_path, ["negatives.source=gtf", "negatives.match_region=true",
+                                    "negatives.region_classes=[UTR, exonic]"]))
+    bad = load_config(cfg_path, ["negatives.source=exons", "negatives.region_classes=[CDS]",
+                                 "negatives.match_region=true", "negatives.strand_aware=maybe"])
+    with pytest.raises(ConfigError) as e:
+        validate(bad)
+    msg = str(e.value)
+    for key in ("negatives.source", "negatives.region_classes", "match_region needs", "negatives.strand_aware"):
+        assert key in msg, key
+    with pytest.raises(ConfigError, match="reference.gtf"):
+        validate(load_config(cfg_path, ["negatives.source=gtf", "reference.gtf=null"]))
+
 
 def test_interpretation_config_validation(synthetic_config):
     cfg_path, d = synthetic_config
@@ -374,6 +408,7 @@ def test_pipeline_interpretation_with_motif_tools(synthetic_config, fake_meme, m
     tt = pd.read_csv(out / "interpretation" / "tomtom_best_matches.csv")
     assert {"query", "query_source", "query_consensus", "target_name"} <= set(tt.columns)
     assert s["enrichment"]["status"] == "ok" and s["enrichment"]["background"].startswith("genes overlapping")
+    assert "protein-coding" in s["enrichment"]["background"]
     assert "GENEA" in captured["query"] and set(captured["query"]) <= set(captured["background"])
     assert s["cnn"]["n_sequences"] == 40 and s["method"] == "saliency"
     assert set(s["lr"]["kmer_sizes"]) == {3, 4}

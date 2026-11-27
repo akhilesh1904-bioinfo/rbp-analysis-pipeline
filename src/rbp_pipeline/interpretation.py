@@ -238,19 +238,25 @@ def _enrichment_section(pos_df, neg_df, cfg, out_dir, idir, summary):
         log.info("  Enrichment skipped (needs reference.gtf and steps.annotation)")
         return
     log.info("  Gene-set enrichment (g:Profiler)...")
+    cache = Path(cfg.output_dir) / "_cache"
     if it.background_genes:
         universe = read_gene_file(Path(it.background_genes))
         bg_label = f"file {Path(it.background_genes).name}"
     elif it.background == "sampled":
-        from .annotation import annotate_regions
-        neg = neg_df.rename(columns={"neg_id": "peak_id"}) if "neg_id" in neg_df else neg_df
-        neg_annot = annotate_regions(neg, Path(cfg.reference.gtf), out_dir, Path(cfg.output_dir) / "_cache")
-        universe = list(pos_df["gene_name"]) + list(neg_annot["gene_name"])
+        if "gene_name" not in neg_df:      # negatives not annotated by the region QC
+            from .annotation import annotate_regions
+            neg_df = annotate_regions(neg_df, Path(cfg.reference.gtf), out_dir, cache, id_col="neg_id", quiet=True)
+        universe = list(pos_df["gene_name"]) + list(neg_df["gene_name"])
         bg_label = "genes overlapping peaks or negatives"
     else:
         universe, bg_label = None, "all annotated genes"
-    result = run_enrichment(pos_df["gene_name"].tolist(), universe, idir,
-                            organism=it.organism, sources=it.enrichment_sources)
+    restrict = None
+    if it.protein_coding_only:
+        from .annotation import protein_coding_genes
+        restrict = protein_coding_genes(Path(cfg.reference.gtf), cache)
+        bg_label += ", protein-coding only"
+    result = run_enrichment(pos_df["gene_name"].tolist(), universe, idir, organism=it.organism,
+                            sources=it.enrichment_sources, restrict_to=restrict)
     summary["enrichment"] = {**result, "background": bg_label}
 
 

@@ -34,6 +34,11 @@ class PeaksConfig:
 class NegativesConfig:
     strategy: str = "gc-matched"         # gc-matched | shuffle
     gc_candidates: int = 10
+    source: str = "genes_bed"            # genes_bed (reference.genes_bed) | gtf (UTR/exonic/intronic sets from reference.gtf)
+    region_classes: List[str] = field(default_factory=lambda: ["UTR", "exonic", "intronic"])  # with source: gtf
+    match_region: bool = False           # with source: gtf, draw each peak's negatives from its own region class
+    strand_aware: bool = True            # place '+' peaks in '+' regions and '-' in '-' (needs stranded regions)
+    qc: bool = True                      # compare region/strand of negatives with positives (needs reference.gtf)
     bed: Optional[str] = None            # pre-computed negatives; skips generation
 
 
@@ -91,6 +96,7 @@ class InterpretationConfig:
     enrichment_sources: List[str] = field(default_factory=lambda: ["GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC"])
     background: str = "sampled"       # sampled (genes overlapping peaks or negatives) | annotated (all g:Profiler genes)
     background_genes: Optional[str] = None   # gene-symbol list (one per line) used instead, e.g. expressed genes
+    protein_coding_only: bool = True  # restrict bound genes and background to protein-coding genes (needs reference.gtf)
 
 
 @dataclass
@@ -124,6 +130,8 @@ class Config:
 
 
 NEGATIVE_STRATEGIES = ("gc-matched", "shuffle")
+NEGATIVE_SOURCES = ("genes_bed", "gtf")
+REGION_CLASS_NAMES = ("UTR", "exonic", "intronic")
 LEAKAGE_MODES = ("report", "remove")
 ASSEMBLIES = ("GRCh38", "GRCh37", "any")
 ATTRIBUTION_METHODS = ("ism", "saliency")
@@ -258,10 +266,23 @@ def validate(cfg: Config) -> None:
     need_file("input", cfg.input)
     need_file("reference.genome", cfg.reference.genome)
     need_file("reference.gtf", cfg.reference.gtf, required=False)
-    if cfg.negatives.bed:
-        need_file("negatives.bed", cfg.negatives.bed)
+    n = cfg.negatives
+    if n.bed:
+        need_file("negatives.bed", n.bed)
+    elif n.source == "gtf":
+        need_file("reference.gtf (needed for negatives.source: gtf)", cfg.reference.gtf)
     else:
         need_file("reference.genes_bed (needed to generate negatives)", cfg.reference.genes_bed)
+    if n.source not in NEGATIVE_SOURCES:
+        problems.append(f"negatives.source must be one of {NEGATIVE_SOURCES}, got '{n.source}'")
+    if (not isinstance(n.region_classes, list) or not n.region_classes
+            or any(c not in REGION_CLASS_NAMES for c in n.region_classes)):
+        problems.append(f"negatives.region_classes must be a non-empty list drawn from {list(REGION_CLASS_NAMES)}")
+    if n.match_region and n.source != "gtf":
+        problems.append("negatives.match_region needs negatives.source: gtf")
+    for key in ("match_region", "strand_aware", "qc"):
+        if not isinstance(getattr(n, key), bool):
+            problems.append(f"negatives.{key} must be true or false")
 
     if cfg.negatives.strategy not in NEGATIVE_STRATEGIES:
         problems.append(f"negatives.strategy must be one of {NEGATIVE_STRATEGIES}, got '{cfg.negatives.strategy}'")
@@ -356,7 +377,7 @@ seed: 42
 
 reference:
   genome: GRCh38.primary_assembly.genome.fa   # chr-prefixed FASTA (GENCODE/UCSC style)
-  genes_bed: genes_only.bed      # regions negatives are drawn from (genes, exons or introns)
+  genes_bed: genes_only.bed      # regions negatives are drawn from; give it a strand column (rbp-pipeline make-regions)
   gtf: null                      # optional GENCODE GTF for exonic/intronic/UTR annotation
   assembly: GRCh38               # GRCh38 | GRCh37 | any — checked against the genome's chr1 length
 
@@ -368,6 +389,11 @@ peaks:
 negatives:
   strategy: gc-matched           # gc-matched | shuffle
   gc_candidates: 10              # candidate regions per peak for gc-matched
+  source: genes_bed              # genes_bed (reference.genes_bed) | gtf (stranded UTR/exonic/intronic from reference.gtf)
+  region_classes: [UTR, exonic, intronic]   # with source: gtf, which classes negatives may come from
+  match_region: false            # with source: gtf, each peak's negatives come from its own region class
+  strand_aware: true             # '+' peaks go into '+' regions, '-' into '-' (needs a strand column in genes_bed)
+  qc: true                       # warn if negatives differ from positives in region class or strand (needs gtf)
   bed: null                      # pre-computed negatives BED (skips generation)
 
 split:
@@ -411,6 +437,7 @@ interpretation:                  # what the models learned (held-out test positi
   enrichment_sources: [GO:BP, GO:MF, GO:CC, KEGG, REAC]
   background: sampled            # sampled: genes overlapping peaks or negatives | annotated: all genes
   background_genes: null         # better: a list of genes expressed in the cell line (one symbol per line)
+  protein_coding_only: true      # restrict bound genes and background to protein-coding genes (needs gtf)
 
 steps:
   annotation: true               # needs reference.gtf

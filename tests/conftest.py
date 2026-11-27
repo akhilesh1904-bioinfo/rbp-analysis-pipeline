@@ -64,16 +64,25 @@ def synthetic_dataset(tmp_path):
     fasta = write_fasta(tmp_path / "genome.fa", genome)
 
     genes_bed = tmp_path / "genes.bed"
-    genes_bed.write_text("".join(f"{c}\t0\t{length}\tgene_{c}\t0\t+\n" for c in chrom_names))
+    # one gene per strand covering each chromosome, so strand-aware shuffling has room for every peak
+    genes_bed.write_text("".join(f"{c}\t0\t{length}\tgene_{c}_{s}\t0\t{s}\n"
+                                 for c in chrom_names for s in "+-"))
 
     peaks_bed = tmp_path / "peaks.bed"
     peaks_bed.write_text("".join("\t".join(map(str, p)) + "\n" for p in peaks))
 
     gtf = tmp_path / "mini.gtf"
-    gtf.write_text(
-        'chr21\ts\tgene\t1\t20000\t.\t+\t.\tgene_name "GENEA";\n'
-        'chr21\ts\tUTR\t1\t999\t.\t+\t.\tgene_name "GENEA";\n'
-        'chr21\ts\texon\t1000\t5000\t.\t+\t.\tgene_name "GENEA";\n')
+    # every chromosome: a '+' gene and a '-' gene, each 1-20,000 with a UTR, two exons and an intron
+    lines = []
+    for c in chrom_names:
+        for s, name in (("+", f"GENE_{c}_P"), ("-", f"GENE_{c}_M")):
+            name = "GENEA" if (c, s) == ("chr21", "+") else name
+            attrs = f'gene_name "{name}"; gene_type "protein_coding";'
+            lines += [f"{c}\ts\tgene\t1\t20000\t.\t{s}\t.\t{attrs}\n",
+                      f"{c}\ts\tUTR\t1\t999\t.\t{s}\t.\t{attrs}\n",
+                      f"{c}\ts\texon\t1\t5000\t.\t{s}\t.\t{attrs}\n",
+                      f"{c}\ts\texon\t12001\t20000\t.\t{s}\t.\t{attrs}\n"]
+    gtf.write_text("".join(lines))
 
     return {"genome": fasta, "genes_bed": genes_bed, "peaks_bed": peaks_bed, "gtf": gtf,
             "genome_seqs": genome, "tmp": tmp_path}
