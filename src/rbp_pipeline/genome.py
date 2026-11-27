@@ -24,6 +24,9 @@ GRCH38_SIZES = {
     "chr21": 46709983, "chr22": 50818468, "chrX": 156040895, "chrY": 57227415,
 }
 
+# chr1 length identifies the build; also used to catch peaks called on a different assembly
+ASSEMBLY_CHR1_LENGTH = {"GRCh38": 248956422, "GRCh37": 249250621}
+
 _COMPLEMENT = str.maketrans("ACGTN", "TGCAN")
 
 
@@ -186,3 +189,52 @@ def check_reference_naming(genome: Genome, regions_bed: Optional[Path]) -> None:
                 raise PipelineError(f"{regions_bed} uses chromosome names without the 'chr' prefix; "
                                     "it must match the genome FASTA (chr1, chr2, ...).")
             raise PipelineError(f"{regions_bed} has no intervals on chr1-22/X/Y.")
+
+
+def check_assembly(genome: Genome, expected: str) -> None:
+    """
+    Compare the genome's chr1 length with known assemblies. A FASTA from a *different* known
+    build (e.g. hg19 when GRCh38 is expected) is an error; an unrecognised length (custom or
+    test genome) only produces a warning.
+    """
+    if expected == "any":
+        return
+    chr1 = genome.chrom_sizes().get("chr1")
+    if chr1 is None:
+        log.warning("  WARNING: cannot verify the genome build (no chr1 / no .fai index)")
+        return
+    if chr1 == ASSEMBLY_CHR1_LENGTH.get(expected):
+        log.info(f"  Genome build        : {expected} (chr1 length matches)")
+        return
+    for build, length in ASSEMBLY_CHR1_LENGTH.items():
+        if chr1 == length:
+            raise PipelineError(f"Genome FASTA looks like {build} (chr1 = {chr1:,} bp) but reference.assembly is "
+                                f"{expected}. Use a {expected} FASTA, or set reference.assembly: {build} if your "
+                                "peaks were called on that build.")
+    log.warning(f"  WARNING: chr1 length {chr1:,} bp does not match {expected}; cannot verify the genome build")
+
+
+def check_peaks_within_genome(peaks: pd.DataFrame, genome: Genome) -> pd.DataFrame:
+    """
+    Peaks running past chromosome ends almost always mean the peaks and genome are different builds:
+    error if more than 0.1% do, otherwise drop them. Returns the peaks that fit.
+    """
+    sizes = genome.chrom_sizes()
+    if not sizes:
+        return peaks
+    limit = peaks["chrom"].map(sizes)
+    missing = peaks[limit.isna()]
+    beyond = peaks[limit.notna() & (peaks["end"] > limit)]
+    if len(missing):
+        log.warning(f"  WARNING: {len(missing):,} peaks on chromosomes absent from the genome FASTA "
+                    f"({sorted(missing['chrom'].unique())[:5]})")
+    if len(beyond):
+        frac = len(beyond) / len(peaks)
+        msg = (f"{len(beyond):,} peaks ({frac:.1%}) extend past the end of their chromosome "
+               f"(e.g. {beyond.iloc[0]['chrom']}:{beyond.iloc[0]['start']}-{beyond.iloc[0]['end']}).")
+        if frac > 0.001:
+            raise PipelineError(msg + " The peaks and genome FASTA are probably different assemblies "
+                                      "(e.g. hg19 peaks with a GRCh38 genome).")
+        log.warning("  WARNING: " + msg + " They will be dropped.")
+        peaks = peaks.drop(index=beyond.index).reset_index(drop=True)
+    return peaks

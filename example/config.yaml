@@ -17,3 +17,10 @@ peaks:
 negatives:
   strategy: gc-matched
   gc_candidates: 30
+
+split:
+  leakage: report
+
+evaluation:
+  n_seeds: 5
+  bootstrap: 1000

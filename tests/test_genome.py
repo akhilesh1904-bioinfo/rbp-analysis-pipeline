@@ -1,12 +1,14 @@
 """Strand-aware sequence extraction, row alignment, and reference naming checks."""
 import shutil
+from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from conftest import write_fasta
 from rbp_pipeline import PipelineError
-from rbp_pipeline.genome import Genome, check_reference_naming, clean_seq, gc_fraction, revcomp
+from rbp_pipeline.genome import (Genome, check_assembly, check_peaks_within_genome, check_reference_naming,
+                                 clean_seq, gc_fraction, revcomp)
 from rbp_pipeline.sequence_extraction import attach_sequences
 
 # chr1 = AAAACCCCGGGGTTTT
@@ -77,3 +79,31 @@ def test_unprefixed_region_bed_rejected(tiny_genome, tmp_path):
     bed.write_text("1\t0\t100\n2\t0\t50\n")
     with pytest.raises(PipelineError, match="without the 'chr' prefix"):
         check_reference_naming(Genome(tiny_genome), bed)
+
+
+def _genome_with_fai(tmp_path, sizes):
+    fa = tmp_path / "g.fa"
+    fa.write_text(">chr1\nACGT\n")
+    Path(str(fa) + ".fai").write_text("".join(f"{c}\t{n}\t6\t4\t5\n" for c, n in sizes.items()))
+    return Genome(fa)
+
+
+def test_wrong_assembly_is_an_error(tmp_path):
+    g = _genome_with_fai(tmp_path, {"chr1": 249250621})       # hg19 chr1
+    with pytest.raises(PipelineError, match="looks like GRCh37"):
+        check_assembly(g, "GRCh38")
+    check_assembly(g, "GRCh37")
+    check_assembly(g, "any")
+
+
+def test_unknown_assembly_only_warns(tmp_path):
+    check_assembly(_genome_with_fai(tmp_path, {"chr1": 40_000}), "GRCh38")
+
+
+def test_peaks_past_chromosome_end(tmp_path):
+    g = _genome_with_fai(tmp_path, {"chr1": 1000})
+    many = pd.DataFrame({"chrom": ["chr1"] * 10, "start": [0] * 9 + [990], "end": [100] * 9 + [1100]})
+    with pytest.raises(PipelineError, match="different assemblies"):
+        check_peaks_within_genome(many, g)
+    few = pd.DataFrame({"chrom": ["chr1"] * 2000, "start": [0] * 1999 + [990], "end": [100] * 1999 + [1100]})
+    assert len(check_peaks_within_genome(few, g)) == 1999

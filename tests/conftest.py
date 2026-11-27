@@ -88,5 +88,6 @@ def synthetic_config(synthetic_dataset):
         "reference": {"genome": "genome.fa", "genes_bed": "genes.bed", "gtf": "mini.gtf"},
         "peaks": {"min_log2fc": 3, "min_log10p": 3},
         "steps": {"report": False},
+        "evaluation": {"bootstrap": 50},   # keep tests fast
     }
     return write_config(d["tmp"] / "config.yaml", data), d

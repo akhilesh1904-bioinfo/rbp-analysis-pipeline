@@ -70,6 +70,8 @@ def make_plots(results: Dict[str, Any], out_dir: Path, name: str) -> None:
     plt.close()
     log.info(f"  Score distributions : {fig_dir / 'score_distributions.png'}")
 
+    _extra_plots(results, fig_dir, name)
+
     history = results.get("cnn_history") or []
     if history:
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -80,6 +82,55 @@ def make_plots(results: Dict[str, Any], out_dir: Path, name: str) -> None:
         plt.tight_layout()
         plt.savefig(fig_dir / "cnn_training_curve.png", dpi=150)
         plt.close()
+
+
+def _extra_plots(results: Dict[str, Any], fig_dir: Path, name: str) -> None:
+    """Precision-recall curves, calibration curves and confusion matrices."""
+    from sklearn.calibration import calibration_curve
+    from sklearn.metrics import precision_recall_curve
+
+    y = np.array(results["test_labels"])
+    metrics = results.get("metrics", {})
+    models = (("cnn", "CNN", "#2196F3"), ("lr", "LR", "#4CAF50"), ("mean", "Ensemble", "#FF5722"))
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for key, label, color in models:
+        prec, rec, _ = precision_recall_curve(y, results[f"{key}_probs"])
+        ap = metrics.get("ensemble" if key == "mean" else key, {}).get("pr_auc", float("nan"))
+        ax.plot(rec, prec, color=color, lw=2, label=f"{label} (AP = {ap:.3f})")
+    prec, rec, _ = precision_recall_curve(y, results["gc_scores"])
+    ax.plot(rec, prec, color="#777777", lw=1.5, ls=":",
+            label=f"GC content only (AP = {metrics.get('gc_baseline', {}).get('pr_auc', float('nan')):.3f})")
+    ax.axhline(y.mean(), color="k", ls="--", lw=1, alpha=0.5, label=f"Chance ({y.mean():.2f})")
+    ax.set_xlabel("Recall", fontsize=12); ax.set_ylabel("Precision", fontsize=12)
+    ax.set_title(f"Precision-recall (held-out test) — {name}", fontsize=12)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02); ax.legend(loc="lower left", fontsize=10); ax.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig(fig_dir / "pr_curve.png", dpi=150); plt.close()
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for key, label, color in models:
+        frac_pos, mean_pred = calibration_curve(y, results[f"{key}_probs"], n_bins=10, strategy="quantile")
+        ax.plot(mean_pred, frac_pos, "o-", color=color, label=label)
+    ax.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5, label="Perfect calibration")
+    ax.set_xlabel("Mean predicted probability", fontsize=12); ax.set_ylabel("Fraction of binding sites", fontsize=12)
+    ax.set_title(f"Calibration (held-out test) — {name}", fontsize=12)
+    ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
+    plt.tight_layout(); plt.savefig(fig_dir / "calibration.png", dpi=150); plt.close()
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    for ax, (key, label, _) in zip(axes, models):
+        c = metrics.get("ensemble" if key == "mean" else key, {}).get("confusion")
+        if not c:
+            ax.axis("off"); continue
+        mat = np.array([[c["tn"], c["fp"]], [c["fn"], c["tp"]]])
+        ax.imshow(mat, cmap="Blues")
+        for (i, j), v in np.ndenumerate(mat):
+            ax.text(j, i, f"{v:,}", ha="center", va="center", color="white" if v > mat.max() / 2 else "black")
+        ax.set_xticks([0, 1], ["pred non-binding", "pred binding"]); ax.set_yticks([0, 1], ["non-binding", "binding"])
+        thr = metrics.get("cnn", {}).get("threshold", 0.5)
+        ax.set_title(f"{label} (threshold {thr})")
+    plt.tight_layout(); plt.savefig(fig_dir / "confusion_matrices.png", dpi=150); plt.close()
+    log.info(f"  PR, calibration and confusion-matrix figures saved to {fig_dir}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,11 +171,24 @@ def save_predictions(pos_df: pd.DataFrame, results: Dict[str, Any], cfg: Config,
 
 
 def save_metrics(results: Dict[str, Any], out_dir: Path, name: str) -> Path:
+    """<name>_metrics.json (everything) and <name>_metrics.csv (one row per model x metric)."""
     keys = ("cnn_auc", "lr_auc", "mean_auc", "gc_auc", "negative_strategy", "gc_positive", "gc_negative",
-            "n_test")
-    metrics = {k: results[k] for k in keys if k in results}
+            "n_test", "seeds", "metrics", "comparisons", "seed_summary", "leakage")
+    payload = {k: results[k] for k in keys if k in results}
     path = out_dir / f"{name}_metrics.json"
-    path.write_text(json.dumps(metrics, indent=2))
+    path.write_text(json.dumps(payload, indent=2))
+
+    rows = []
+    seeds = results.get("seed_summary") or {}
+    for model, m in results.get("metrics", {}).items():
+        for metric, value in m.items():
+            if not isinstance(value, (int, float)) or metric in ("n", "n_pos", "threshold"):
+                continue
+            ci = m.get(f"{metric}_ci") or [None, None]
+            sd = seeds.get(model, {}).get(metric, {})
+            rows.append({"model": model, "metric": metric, "value": value, "ci_low": ci[0], "ci_high": ci[1],
+                         "seed_mean": sd.get("mean"), "seed_sd": sd.get("sd")})
+    pd.DataFrame(rows).to_csv(out_dir / f"{name}_metrics.csv", index=False)
     return path
 
 
@@ -156,6 +220,30 @@ def _tool_version(cmd) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Word report
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _metric_rows(results: Dict[str, Any], row) -> list:
+    m = results.get("metrics", {})
+    out = []
+    for key, label in (("cnn", "CNN"), ("lr", "LR")):
+        if key in m:
+            ci = m[key].get("roc_auc_ci") or [float("nan")] * 2
+            out.append(row(f"{label} ROC-AUC (95% CI)", f"{m[key]['roc_auc']:.3f} [{ci[0]:.3f}-{ci[1]:.3f}]"))
+            out.append(row(f"{label} PR-AUC / F1 / MCC",
+                           f"{m[key]['pr_auc']:.3f} / {m[key]['f1']:.3f} / {m[key]['mcc']:.3f}"))
+    d = (results.get("comparisons") or {}).get("cnn_vs_lr")
+    if d:
+        out.append(row("CNN - LR ROC-AUC (95% CI)", f"{d['diff']:+.3f} [{d['ci_low']:+.3f}, {d['ci_high']:+.3f}]"))
+    ss = results.get("seed_summary")
+    if ss:
+        out.append(row(f"CNN ROC-AUC over {len(results['seeds'])} seeds",
+                       f"{ss['cnn']['roc_auc']['mean']:.3f} ± {ss['cnn']['roc_auc']['sd']:.3f}"))
+    lk = results.get("leakage")
+    if lk:
+        t = lk["test"]
+        out.append(row("Test sequences resembling training",
+                       f"{t['n_flagged']:,} / {t['n_sequences']:,} ({100*t['fraction_flagged']:.1f}%; mode: {lk['mode']})"))
+    return out
+
 
 def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: Config, out_dir: Path) -> None:
     log.info("\n[8/8] Generating Word report...")
@@ -190,9 +278,9 @@ def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: C
         row("High-confidence test peaks", f"{n_high:,} ({pct_high:.1f}%)"),
         row("Test chromosomes", " ".join(cfg.split.test_chroms)),
         row("Val chromosomes", " ".join(cfg.split.val_chroms)),
-        row("CNN AUC", f"{results['cnn_auc']:.4f}"), row("LR AUC", f"{results['lr_auc']:.4f}"),
         row("Ensemble AUC", f"{results['mean_auc']:.4f}"),
         row("GC-only baseline AUC", f"{results['gc_auc']:.4f}"),
+        *_metric_rows(results, row),
         row("Negative strategy", results.get("negative_strategy", "")),
         row("Mean GC (pos / neg)", f"{results.get('gc_positive', 0):.1f}% / {results.get('gc_negative', 0):.1f}%"),
     ])
@@ -217,7 +305,13 @@ def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: C
                 f"BCEWithLogitsLoss, early stopping on validation loss (patience={cfg.model.patience}), max "
                 f"{cfg.model.epochs} epochs. One-hot input of {cfg.model.max_len} bp (longer sequences centre-cropped)."),
         "lr": "k-mer logistic regression with 2-mer and 3-mer counts (CountVectorizer fit on training data only).",
-        "eval": ("AUC computed on held-out test chromosomes only. Peak tables in this report show test-chromosome "
+        "eval": ("Metrics computed on held-out test chromosomes only: ROC-AUC, PR-AUC (average precision), and "
+                 f"precision, recall, F1, MCC and Brier score at threshold {cfg.evaluation.threshold}, with "
+                 f"{cfg.evaluation.bootstrap} bootstrap resamples for 95% CIs"
+                 + (f" and {cfg.evaluation.n_seeds} training seeds" if cfg.evaluation.n_seeds > 1 else "")
+                 + f". Validation/test sequences resembling training sequences (identical, reverse complement or a "
+                 f"shared {cfg.split.leakage_kmer}-mer) were {'removed' if cfg.split.leakage == 'remove' else 'counted'}. "
+                 "AUC computed on held-out test chromosomes only. Peak tables in this report show test-chromosome "
                  "peaks only, because scores for training peaks are optimistic."),
     }
 
@@ -282,7 +376,7 @@ const doc = new Document({{
         rows: [ new TableRow({{ children: [hcell("Parameter",3600), hcell("Value",5760)] }}), {summary_rows} ] }}),
       spacer(),
       h1("2. Model Performance"), para({interp}), spacer(),
-      para("See figures/roc_curve.png (with GC-only baseline), figures/score_distributions.png and figures/cnn_training_curve.png."),
+      para("Figures: roc_curve.png and pr_curve.png (with GC-only baseline), calibration.png, confusion_matrices.png, score_distributions.png, cnn_training_curve.png. Full metrics with confidence intervals: <name>_metrics.csv."),
       spacer(),
       h1("3. Top 5 Held-Out Test Peaks by Binding Probability"),
       new Table({{ width: {{ size: 9360, type: WidthType.DXA }}, columnWidths: [2800, 1600, 1400, 1000, 1000, 1000],

@@ -31,16 +31,19 @@ def set_seed(seed: int) -> None:
 
 
 class RBP_CNN(nn.Module):
-    """Conv(4->64,k7)-BN-Pool(4) -> Conv(64->128,k7)-BN-Pool(4) -> global max -> FC(128->64->1)."""
+    """Conv(4->64,k7)-BN-Pool(4) -> Conv(64->128,k7)-BN-Pool(4) -> global max -> FC(128->64->1).
 
-    def __init__(self):
+    No reverse-complement augmentation: sequences are single-stranded RNA in a fixed orientation.
+    """
+
+    def __init__(self, dropout: float = 0.3):
         super().__init__()
         self.conv1 = nn.Conv1d(4, 64, kernel_size=7, padding=3)
         self.bn1 = nn.BatchNorm1d(64)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=7, padding=3)
         self.bn2 = nn.BatchNorm1d(128)
         self.pool = nn.MaxPool1d(kernel_size=4)
-        self.classifier = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, 1))
+        self.classifier = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 1))
 
     def forward(self, x):
         x = torch.relu(self.bn1(self.conv1(x)))
@@ -56,8 +59,11 @@ def train_cnn(train: Tuple[List[str], List[int]], val: Tuple[List[str], List[int
     """Train with early stopping on validation loss. Returns (best model, per-epoch history)."""
     log.info("  Training CNN...")
     set_seed(seed)
-    model = RBP_CNN().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    model = RBP_CNN(dropout=cfg.dropout).to(device)
+    if cfg.weight_decay > 0:   # decoupled weight decay
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
     criterion = nn.BCEWithLogitsLoss()
 
     loader_gen = torch.Generator().manual_seed(seed)

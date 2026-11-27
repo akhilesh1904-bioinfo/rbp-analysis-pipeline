@@ -11,6 +11,7 @@ reference:
   genome: GRCh38.primary_assembly.genome.fa   # chr-prefixed FASTA (GENCODE/UCSC style)
   genes_bed: genes_only.bed      # regions negatives are drawn from (genes, exons or introns)
   gtf: null                      # optional GENCODE GTF for exonic/intronic/UTR annotation
+  assembly: GRCh38               # GRCh38 | GRCh37 | any — checked against the genome's chr1 length
 
 peaks:
   min_log2fc: null               # keep peaks with log2 fold-enrichment (BED col 7) >= this; ENCODE uses 3
@@ -25,6 +26,8 @@ negatives:
 split:
   test_chroms: [chr21, chr22, chrX]
   val_chroms: [chr19, chr20]
+  leakage: report                # report | remove val/test sequences that resemble training ones
+  leakage_kmer: 20               # resemblance = identical, reverse complement, or a shared 20-mer
 
 model:
   max_len: 126                   # CNN input length; longer sequences are centre-cropped
@@ -32,6 +35,13 @@ model:
   patience: 5                    # early-stopping patience (epochs without val-loss improvement)
   batch_size: 64
   learning_rate: 0.001
+  dropout: 0.3
+  weight_decay: 0.0              # e.g. 0.0001 to reduce overfitting (uses AdamW)
+
+evaluation:
+  n_seeds: 1                     # e.g. 5: retrain with 5 seeds and report mean ± SD
+  bootstrap: 1000                # resamples for 95% confidence intervals (0 = off)
+  threshold: 0.5                 # cut-off for precision, recall, F1, MCC, confusion matrix
 
 steps:
   annotation: true               # needs reference.gtf

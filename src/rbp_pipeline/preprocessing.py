@@ -110,12 +110,18 @@ def validate_bed(bed_path: Path, out_dir: Path,
         log.warning(f"  WARNING: {n_unstranded:,} peaks have no strand ('.'); the + strand will be used. "
                     "eCLIP is stranded — check your input.")
 
+    cleaned = write_cleaned_bed(df, out_dir)
+    log.info(f"  Cleaned BED saved   : {cleaned}")
+    return df
+
+
+def write_cleaned_bed(df: pd.DataFrame, out_dir: Path) -> Path:
+    """peaks_cleaned.bed: the peak set actually used (name column = peak_id)."""
     cleaned = Path(out_dir) / "peaks_cleaned.bed"
     out = df[["chrom", "start", "end", "peak_id", "score", "strand"]].copy()
     out["score"] = out["score"].fillna(0)
     out.to_csv(cleaned, sep="\t", index=False, header=False)
-    log.info(f"  Cleaned BED saved   : {cleaned}")
-    return df
+    return cleaned
 
 
 def read_bed(path: Path, id_prefix: str) -> pd.DataFrame:

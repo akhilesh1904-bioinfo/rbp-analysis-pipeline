@@ -20,6 +20,7 @@ class ReferenceConfig:
     genome: Optional[str] = None      # GRCh38 FASTA with chr-prefixed names
     genes_bed: Optional[str] = None   # regions negatives are drawn from (genes, exons, introns...)
     gtf: Optional[str] = None         # optional GENCODE GTF for region annotation
+    assembly: str = "GRCh38"          # GRCh38 | GRCh37 | any (skip the build check)
 
 
 @dataclass
@@ -40,6 +41,8 @@ class NegativesConfig:
 class SplitConfig:
     test_chroms: List[str] = field(default_factory=lambda: ["chr21", "chr22", "chrX"])
     val_chroms: List[str] = field(default_factory=lambda: ["chr19", "chr20"])
+    leakage: str = "report"           # report | remove : val/test sequences resembling training ones
+    leakage_kmer: int = 20            # shared exact substring length that counts as resemblance
 
 
 @dataclass
@@ -49,6 +52,15 @@ class ModelConfig:
     patience: int = 5
     batch_size: int = 64
     learning_rate: float = 1e-3
+    dropout: float = 0.3
+    weight_decay: float = 0.0         # >0 switches the optimiser to AdamW
+
+
+@dataclass
+class EvaluationConfig:
+    n_seeds: int = 1                  # retrain models with this many seeds; report mean ± SD
+    bootstrap: int = 1000             # bootstrap resamples for 95% CIs (0 = off)
+    threshold: float = 0.5            # probability cut-off for precision/recall/F1/MCC
 
 
 @dataclass
@@ -68,6 +80,7 @@ class Config:
     negatives: NegativesConfig = field(default_factory=NegativesConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
     steps: StepsConfig = field(default_factory=StepsConfig)
 
     @property
@@ -79,6 +92,8 @@ class Config:
 
 
 NEGATIVE_STRATEGIES = ("gc-matched", "shuffle")
+LEAKAGE_MODES = ("report", "remove")
+ASSEMBLIES = ("GRCh38", "GRCh37", "any")
 INPUT_PATH_FIELDS = ("input", "reference.genome", "reference.genes_bed", "reference.gtf", "negatives.bed")
 
 
@@ -234,6 +249,21 @@ def validate(cfg: Config) -> None:
     if bad:
         problems.append(f"split chromosomes must use chr-prefixed names (e.g. chr21), got {bad}")
 
+    if cfg.reference.assembly not in ASSEMBLIES:
+        problems.append(f"reference.assembly must be one of {ASSEMBLIES}, got '{cfg.reference.assembly}'")
+    if cfg.split.leakage not in LEAKAGE_MODES:
+        problems.append(f"split.leakage must be one of {LEAKAGE_MODES}, got '{cfg.split.leakage}'")
+    if not isinstance(cfg.split.leakage_kmer, int) or cfg.split.leakage_kmer < 8:
+        problems.append("split.leakage_kmer must be a whole number >= 8")
+
+    e = cfg.evaluation
+    if not isinstance(e.n_seeds, int) or e.n_seeds < 1:
+        problems.append("evaluation.n_seeds must be a whole number >= 1")
+    if not isinstance(e.bootstrap, int) or e.bootstrap < 0:
+        problems.append("evaluation.bootstrap must be a whole number >= 0")
+    if not isinstance(e.threshold, (int, float)) or not 0 < e.threshold < 1:
+        problems.append("evaluation.threshold must be between 0 and 1")
+
     m = cfg.model
     for key, minimum in (("max_len", 8), ("epochs", 1), ("patience", 1), ("batch_size", 1)):
         v = getattr(m, key)
@@ -241,6 +271,10 @@ def validate(cfg: Config) -> None:
             problems.append(f"model.{key} must be a whole number >= {minimum}")
     if not isinstance(m.learning_rate, (int, float)) or m.learning_rate <= 0:
         problems.append("model.learning_rate must be a positive number")
+    if not isinstance(m.dropout, (int, float)) or not 0 <= m.dropout < 1:
+        problems.append("model.dropout must be between 0 and 1")
+    if not isinstance(m.weight_decay, (int, float)) or m.weight_decay < 0:
+        problems.append("model.weight_decay must be >= 0")
     if not isinstance(cfg.seed, int):
         problems.append("seed must be a whole number")
 
@@ -262,6 +296,7 @@ reference:
   genome: GRCh38.primary_assembly.genome.fa   # chr-prefixed FASTA (GENCODE/UCSC style)
   genes_bed: genes_only.bed      # regions negatives are drawn from (genes, exons or introns)
   gtf: null                      # optional GENCODE GTF for exonic/intronic/UTR annotation
+  assembly: GRCh38               # GRCh38 | GRCh37 | any — checked against the genome's chr1 length
 
 peaks:
   min_log2fc: null               # keep peaks with log2 fold-enrichment (BED col 7) >= this; ENCODE uses 3
@@ -276,6 +311,8 @@ negatives:
 split:
   test_chroms: [chr21, chr22, chrX]
   val_chroms: [chr19, chr20]
+  leakage: report                # report | remove val/test sequences that resemble training ones
+  leakage_kmer: 20               # resemblance = identical, reverse complement, or a shared 20-mer
 
 model:
   max_len: 126                   # CNN input length; longer sequences are centre-cropped
@@ -283,6 +320,13 @@ model:
   patience: 5                    # early-stopping patience (epochs without val-loss improvement)
   batch_size: 64
   learning_rate: 0.001
+  dropout: 0.3
+  weight_decay: 0.0              # e.g. 0.0001 to reduce overfitting (uses AdamW)
+
+evaluation:
+  n_seeds: 1                     # e.g. 5: retrain with 5 seeds and report mean ± SD
+  bootstrap: 1000                # resamples for 95% confidence intervals (0 = off)
+  threshold: 0.5                 # cut-off for precision, recall, F1, MCC, confusion matrix
 
 steps:
   annotation: true               # needs reference.gtf

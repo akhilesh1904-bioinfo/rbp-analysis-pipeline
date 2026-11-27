@@ -66,11 +66,16 @@ def test_validation_reports_all_problems_at_once(tmp_path):
     cfg.negatives.strategy = "random"
     cfg.split.val_chroms = ["chr21"]
     cfg.peaks.window = 3
+    cfg.split.leakage = "drop"
+    cfg.evaluation.n_seeds = 0
+    cfg.model.dropout = 1.5
+    cfg.reference.assembly = "hg38"
     with pytest.raises(ConfigError) as e:
         validate(cfg)
     msg = str(e.value)
     for fragment in ("name 'bad name!'", "input not found", "reference.genome is required",
-                     "negatives.strategy", "both split.test_chroms and split.val_chroms", "peaks.window"):
+                     "negatives.strategy", "both split.test_chroms and split.val_chroms", "peaks.window",
+                     "split.leakage", "evaluation.n_seeds", "model.dropout", "reference.assembly"):
         assert fragment in msg, fragment
 
 
