@@ -9,11 +9,12 @@ from typing import Any, Dict
 from . import __version__
 from .annotation import annotate_regions, skip_annotation
 from .config import Config, validate
-from .dataset import build_splits
-from .genome import Genome, check_reference_naming
+from .dataset import assign_splits, balance_splits
+from .genome import Genome, check_assembly, check_peaks_within_genome, check_reference_naming
+from .leakage import check_leakage
 from .models import DEVICE, set_seed
 from .negative_sampling import gc_summary, generate_candidates, select_gc_matched
-from .preprocessing import read_bed, validate_bed
+from .preprocessing import read_bed, validate_bed, write_cleaned_bed
 from .reporting import (generate_word_report, make_plots, save_metrics, save_predictions,
                         save_run_info)
 from .sequence_extraction import extract_sequences, write_fasta
@@ -57,9 +58,14 @@ def run(cfg: Config) -> Dict[str, Any]:
     genome = Genome(Path(cfg.reference.genome))
     regions_bed = None if cfg.negatives.bed else Path(cfg.reference.genes_bed)
     check_reference_naming(genome, regions_bed)
+    check_assembly(genome, cfg.reference.assembly)
 
     # 1. Peaks
     peaks_df = validate_bed(Path(cfg.input), out_dir, cfg.peaks.min_log2fc, cfg.peaks.min_log10p, cfg.peaks.window)
+    n_before = len(peaks_df)
+    peaks_df = check_peaks_within_genome(peaks_df, genome)
+    if len(peaks_df) != n_before:
+        write_cleaned_bed(peaks_df, out_dir)
 
     # 2. Negatives (candidates)
     neg_bed = out_dir / f"{cfg.name}_negatives.bed"
@@ -84,11 +90,14 @@ def run(cfg: Config) -> Dict[str, Any]:
         log.info(f"  GC-matched negatives: {len(neg_df):,}")
     pos_gc, neg_gc = gc_summary(pos_df, neg_df)
 
-    # 4. Splits + models
-    data, pos_df, neg_df = build_splits(pos_df, neg_df, cfg.split.test_chroms, cfg.split.val_chroms, cfg.seed)
+    # 4. Splits (+ leakage check) + models
+    pos_df, neg_df = assign_splits(pos_df, neg_df, cfg.split.test_chroms, cfg.split.val_chroms)
+    pos_df, neg_df, leakage, leaks = check_leakage(pos_df, neg_df, cfg.split.leakage, cfg.split.leakage_kmer)
+    leaks.to_csv(out_dir / "leakage_flags.csv", index=False)
+    data = balance_splits(pos_df, neg_df, cfg.seed)
     results = train_and_score(data, cfg, out_dir)
     results.update(negative_strategy=strategy, gc_positive=pos_gc, gc_negative=neg_gc,
-                   n_test=len(data["test"][1]))
+                   n_test=len(data["test"][1]), leakage=leakage)
 
     # 5-8. Outputs
     make_plots(results, out_dir, cfg.name)

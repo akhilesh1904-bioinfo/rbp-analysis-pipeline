@@ -26,28 +26,27 @@ def assign_split(chrom: str, test_set: set, val_set: set) -> str:
     return "train"
 
 
-def build_splits(pos_df: pd.DataFrame, neg_df: pd.DataFrame, test_chroms: Sequence[str],
-                 val_chroms: Sequence[str], seed: int) -> Tuple[SplitData, pd.DataFrame, pd.DataFrame]:
-    """
-    Split positives and negatives by chromosome, then balance each split by downsampling.
-    Returns ({split: (seqs, labels)}, pos_df with 'split', neg_df with 'split').
-    """
+def assign_splits(pos_df: pd.DataFrame, neg_df: pd.DataFrame, test_chroms: Sequence[str],
+                  val_chroms: Sequence[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Add a 'split' column (train / val / test) to positives and negatives by chromosome."""
     log.info("\n[3/8] Building chromosome splits...")
     test_set, val_set = set(test_chroms), set(val_chroms)
     if test_set & val_set:
         raise PipelineError(f"Chromosomes in both test and val sets: {sorted(test_set & val_set)}")
-
     present = set(pos_df["chrom"])
     for label, chroms in (("test", test_set), ("val", val_set)):
         missing = sorted(chroms - present)
         if missing:
             log.info(f"  Note: {label} chromosomes with no peaks: {missing}")
-
     pos_df = pos_df.copy()
     neg_df = neg_df.copy()
     pos_df["split"] = [assign_split(c, test_set, val_set) for c in pos_df["chrom"]]
     neg_df["split"] = [assign_split(c, test_set, val_set) for c in neg_df["chrom"]]
+    return pos_df, neg_df
 
+
+def balance_splits(pos_df: pd.DataFrame, neg_df: pd.DataFrame, seed: int) -> SplitData:
+    """Balance positives and negatives within each split by downsampling the larger class."""
     rng = random.Random(seed)
     data: SplitData = {}
     for split in ("train", "val", "test"):
@@ -60,11 +59,22 @@ def build_splits(pos_df: pd.DataFrame, neg_df: pd.DataFrame, test_chroms: Sequen
         data[split] = ([s for s, _ in combined], [l for _, l in combined])
         log.info(f"  {split.capitalize():<5} set           : {2*n:,} sequences ({n:,} pos / {n:,} neg)")
 
+    present = sorted(set(pos_df["chrom"]))
     for split, hint in (("test", "split.test_chroms"), ("val", "split.val_chroms"), ("train", "the split")):
         if len(data[split][0]) == 0:
-            raise PipelineError(f"The {split} set is empty. Chromosomes in data: {sorted(present)}. "
+            raise PipelineError(f"The {split} set is empty. Chromosomes in data: {present}. "
                                 f"Adjust {hint} to chromosomes present in your data.")
-    return data, pos_df, neg_df
+    return data
+
+
+def build_splits(pos_df: pd.DataFrame, neg_df: pd.DataFrame, test_chroms: Sequence[str],
+                 val_chroms: Sequence[str], seed: int) -> Tuple[SplitData, pd.DataFrame, pd.DataFrame]:
+    """
+    Split positives and negatives by chromosome, then balance each split by downsampling.
+    Returns ({split: (seqs, labels)}, pos_df with 'split', neg_df with 'split').
+    """
+    pos_df, neg_df = assign_splits(pos_df, neg_df, test_chroms, val_chroms)
+    return balance_splits(pos_df, neg_df, seed), pos_df, neg_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────

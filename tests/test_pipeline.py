@@ -113,7 +113,8 @@ def test_gc_matching_closes_a_gc_gap(tmp_path):
     cfg_path = write_config(tmp_path / "c.yaml", {
         "name": "X", "input": "peaks.bed", "output_dir": str(tmp_path / "res"),
         "reference": {"genome": "g.fa", "genes_bed": "genes.bed"},
-        "negatives": {"gc_candidates": 20}, "peaks": {"window": None}, "steps": {"report": False}})
+        "negatives": {"gc_candidates": 20}, "peaks": {"window": None}, "steps": {"report": False},
+        "evaluation": {"bootstrap": 0}})
 
     gaps = {}
     for strategy in ("shuffle", "gc-matched"):
@@ -121,3 +122,58 @@ def test_gc_matching_closes_a_gc_gap(tmp_path):
         gaps[strategy] = (res["gc_positive"] - res["gc_negative"], res["gc_auc"])
     assert gaps["gc-matched"][0] < gaps["shuffle"][0] / 2
     assert gaps["gc-matched"][1] < gaps["shuffle"][1]
+
+
+@needs_tools
+def test_multi_seed_metrics_and_outputs(synthetic_config):
+    cfg_path, d = synthetic_config
+    res = run(load_config(cfg_path, ["evaluation.n_seeds=2", "model.epochs=3", "steps.annotation=false",
+                                     "model.weight_decay=0.0001"]))
+    out = d["tmp"] / "results" / "SYN"
+    assert res["seeds"] == [42, 43]
+    s = res["seed_summary"]["cnn"]["roc_auc"]
+    assert len(s["values"]) == 2 and s["sd"] >= 0
+    m = res["metrics"]
+    assert set(m) == {"cnn", "lr", "ensemble", "gc_baseline"}
+    assert {"pr_auc", "f1", "mcc", "brier", "confusion", "roc_auc_ci"} <= set(m["cnn"])
+    assert "f1" not in m["gc_baseline"]                       # GC fraction is not a probability
+    lo, hi = m["cnn"]["roc_auc_ci"]
+    assert lo <= m["cnn"]["roc_auc"] <= hi
+    assert set(res["comparisons"]) == {"cnn_vs_lr", "cnn_vs_gc_baseline", "lr_vs_gc_baseline"}
+
+    saved = json.loads((out / "SYN_metrics.json").read_text())
+    assert saved["seed_summary"]["cnn"]["roc_auc"]["values"] == s["values"]
+    table = pd.read_csv(out / "SYN_metrics.csv")
+    assert {"model", "metric", "value", "ci_low", "ci_high", "seed_mean", "seed_sd"} <= set(table.columns)
+    for fig in ("pr_curve", "calibration", "confusion_matrices", "roc_curve"):
+        assert (out / "figures" / f"{fig}.png").exists(), fig
+    assert "leakage" in saved and (out / "leakage_flags.csv").exists()
+
+
+@needs_tools
+def test_leakage_remove_mode_runs(synthetic_config):
+    """Copy some training peaks onto test chromosomes; remove mode must drop them from the test set."""
+    cfg_path, d = synthetic_config
+    genome = d["genome_seqs"]
+    # duplicate 10 chr1 peak sequences into chr21 at fresh positions (forward strand)
+    peaks = pd.read_csv(d["peaks_bed"], sep="\t", header=None)
+    chr21 = list(genome["chr21"])
+    extra = []
+    for i, r in enumerate(peaks[peaks[0] == "chr1"].head(10).itertuples()):
+        seq = genome["chr1"][r[2]:r[3]]
+        seq = revcomp(seq) if r[6] == "-" else seq
+        pos = 37_000 + i * 250
+        chr21[pos:pos + len(seq)] = list(seq)
+        extra.append(f"chr21\t{pos}\t{pos + len(seq)}\tdup{i}\t1000\t+\t4\t5\n")
+    genome["chr21"] = "".join(chr21)
+    write_fasta(d["genome"], genome)
+    Path(str(d["genome"]) + ".fai").unlink(missing_ok=True)
+    with open(d["peaks_bed"], "a") as f:
+        f.writelines(extra)
+
+    res = run(load_config(cfg_path, ["split.leakage=remove", "steps.annotation=false", "model.epochs=2"]))
+    assert res["leakage"]["test"]["by_reason"].get("exact", 0) >= 10
+    flags = pd.read_csv(d["tmp"] / "results" / "SYN" / "leakage_flags.csv")
+    preds = pd.read_csv(d["tmp"] / "results" / "SYN" / "SYN_predictions.csv")
+    test_ids = set(preds.loc[preds.split == "test", "peak_id"])
+    assert test_ids.isdisjoint(set(flags["seq_id"]))

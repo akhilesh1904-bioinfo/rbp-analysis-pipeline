@@ -59,3 +59,14 @@ def test_cnn_training_is_reproducible():
     runs = [train_cnn((seqs, labels), (seqs[:16], labels[:16]), cfg, seed=3)[0].state_dict() for _ in range(2)]
     for k in runs[0]:
         assert torch.equal(runs[0][k], runs[1][k]), k
+
+
+def test_weight_decay_and_dropout_change_training():
+    rng = np.random.default_rng(1)
+    seqs = ["".join(rng.choice(list("ACGT"), 40)) for _ in range(64)]
+    labels = [i % 2 for i in range(64)]
+    base = train_cnn((seqs, labels), (seqs[:16], labels[:16]), ModelConfig(max_len=40, epochs=2), seed=3)[0]
+    reg = train_cnn((seqs, labels), (seqs[:16], labels[:16]),
+                    ModelConfig(max_len=40, epochs=2, weight_decay=0.1, dropout=0.5), seed=3)[0]
+    assert reg.classifier[2].p == 0.5
+    assert not torch.equal(base.conv1.weight, reg.conv1.weight)

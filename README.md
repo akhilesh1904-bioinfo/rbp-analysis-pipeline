@@ -10,9 +10,11 @@ For each protein the pipeline:
 2. Generates negatives matched to each peak's **length, chromosome and GC content**, drawn from a region set you choose (genes, exons or introns)
 3. Extracts sequences in the **RNA sense** (minus-strand peaks are reverse-complemented)
 4. Trains a 1D CNN and a k-mer logistic regression on a **chromosome-held-out split**
-5. Reports test-set AUC for both models, their ensemble, and a **GC-content-only baseline**
-6. Annotates peaks as UTR / exonic / intronic / intergenic, **strand-aware**
-7. Writes a predictions table, figures, metrics, a run log, a Word report and full run metadata
+5. Evaluates on the test set with ROC-AUC, PR-AUC, precision, recall, F1, MCC, Brier score, confusion matrices and calibration, with **bootstrap 95% CIs**, **paired significance tests** (CNN vs LR vs a **GC-content-only baseline**) and optional **multi-seed** mean ± SD
+6. Checks for **sequence leakage**: val/test sequences identical to, reverse-complementary to, or sharing a 20-mer with training sequences (report or remove)
+7. Validates the **genome build** (GRCh38 vs GRCh37 by chr1 length) and flags peaks that run past chromosome ends
+8. Annotates peaks as UTR / exonic / intronic / intergenic, **strand-aware**
+9. Writes a predictions table, figures, metrics, a run log, a Word report and full run metadata
 
 ## Installation
 
@@ -68,8 +70,9 @@ Results go to `<output_dir>/<name>/`:
 | File | Contents |
 |---|---|
 | `<name>_predictions.csv` | every peak with CNN/LR scores, `split`, `seen_in_training`, region and gene |
-| `<name>_metrics.json` | test AUCs (CNN, LR, ensemble, GC-only baseline), GC of positives/negatives |
-| `figures/` | ROC curve with GC baseline, score distributions, CNN training curve |
+| `<name>_metrics.json` / `.csv` | all test metrics with 95% CIs, paired model comparisons, seed mean ± SD, leakage summary |
+| `leakage_flags.csv` | val/test sequences resembling training sequences, with the reason |
+| `figures/` | ROC and precision-recall curves (with GC baseline), calibration, confusion matrices, score distributions, CNN training curve |
 | `<name>_report.docx` | summary report with methods |
 | `pipeline.log`, `run_info.json` | full log; exact config and software versions |
 | `positives.fa`, `negatives.fa`, `*_negatives.bed`, `<name>_cnn.pt` | intermediate data and model weights |
@@ -87,6 +90,20 @@ Example (IGF2BP2, K562, 3,834 IDR peaks, held-out chr21/chr22/chrX):
 | Random within genes | 0.815 | 0.893 | 0.850 |
 | GC-matched, exons only, 100 bp window | 0.509 | 0.794 | 0.756 |
 
+## Recommended settings for reporting results
+
+```yaml
+evaluation:
+  n_seeds: 5          # mean ± SD over 5 CNN trainings
+  bootstrap: 1000     # 95% CIs and paired tests
+split:
+  leakage: remove     # compare with `report` to see whether near-duplicates inflate performance
+model:
+  weight_decay: 0.0001   # optional: reduces CNN overfitting (check the training curve)
+```
+
+A model comparison counts as significant only when the paired bootstrap interval for the AUC difference excludes zero. With a few hundred test sequences, AUC differences below about 0.03 are usually within noise.
+
 ## Project structure
 
 ```
@@ -99,7 +116,8 @@ src/rbp_pipeline/
   dataset.py             chromosome splits, one-hot and k-mer encodings
   models.py              CNN and logistic regression
   training.py            training + test-set scoring
-  evaluation.py          metrics and baselines
+  evaluation.py          metrics, bootstrap CIs, paired comparisons, seed summaries
+  leakage.py             exact / reverse-complement / shared k-mer overlap between splits
   annotation.py          strand-aware UTR/exonic/intronic annotation (bedtools)
   reporting.py           figures, tables, Word report, run metadata
   pipeline.py            runs the steps in order
