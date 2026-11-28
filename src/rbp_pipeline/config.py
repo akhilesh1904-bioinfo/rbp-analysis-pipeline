@@ -40,6 +40,7 @@ class NegativesConfig:
     strand_aware: bool = True            # place '+' peaks in '+' regions and '-' in '-' (needs stranded regions)
     qc: bool = True                      # compare region/strand of negatives with positives (needs reference.gtf)
     bed: Optional[str] = None            # pre-computed negatives; skips generation
+    max_gc_diff: Optional[float] = None  # gc-matched: max |GC(peak) - GC(negative)| as a fraction (e.g. 0.05)
 
 
 @dataclass
@@ -48,6 +49,7 @@ class SplitConfig:
     val_chroms: List[str] = field(default_factory=lambda: ["chr19", "chr20"])
     leakage: str = "report"           # report | remove : val/test sequences resembling training ones
     leakage_kmer: int = 20            # shared exact substring length that counts as resemblance
+    balance: str = "paired"           # paired: keep each peak with its matched negative | random
 
 
 @dataclass
@@ -67,6 +69,7 @@ class EvaluationConfig:
     n_seeds: int = 1                  # retrain models with this many seeds; report mean ± SD
     bootstrap: int = 1000             # bootstrap resamples for 95% CIs (0 = off)
     threshold: float = 0.5            # probability cut-off for precision/recall/F1/MCC
+    bootstrap_unit: str = "pair"      # pair (peak + its negative) | gene | sequence
 
 
 # A small panel of RNA sequence elements frequently reported for RBPs (IUPAC, RNA alphabet), checked
@@ -134,6 +137,8 @@ NEGATIVE_STRATEGIES = ("gc-matched", "shuffle")
 NEGATIVE_SOURCES = ("genes_bed", "gtf")
 REGION_CLASS_NAMES = ("UTR", "exonic", "intronic")
 LEAKAGE_MODES = ("report", "remove")
+BALANCE_MODES = ("paired", "random")
+BOOTSTRAP_UNITS = ("pair", "gene", "sequence")
 ASSEMBLIES = ("GRCh38", "GRCh37", "any")
 ATTRIBUTION_METHODS = ("ism", "saliency")
 BACKGROUNDS = ("sampled", "annotated")
@@ -289,6 +294,9 @@ def validate(cfg: Config) -> None:
         problems.append(f"negatives.strategy must be one of {NEGATIVE_STRATEGIES}, got '{cfg.negatives.strategy}'")
     if not isinstance(cfg.negatives.gc_candidates, int) or cfg.negatives.gc_candidates < 1:
         problems.append("negatives.gc_candidates must be a whole number >= 1")
+    g = cfg.negatives.max_gc_diff
+    if g is not None and (isinstance(g, bool) or not isinstance(g, (int, float)) or not 0 < g <= 1):
+        problems.append("negatives.max_gc_diff must be a GC fraction between 0 and 1 (e.g. 0.05), or null")
     if cfg.peaks.window is not None and (not isinstance(cfg.peaks.window, int) or cfg.peaks.window < 8):
         problems.append("peaks.window must be a whole number >= 8 (or null)")
     for key in ("min_log2fc", "min_log10p"):
@@ -313,6 +321,8 @@ def validate(cfg: Config) -> None:
         problems.append(f"split.leakage must be one of {LEAKAGE_MODES}, got '{cfg.split.leakage}'")
     if not isinstance(cfg.split.leakage_kmer, int) or cfg.split.leakage_kmer < 8:
         problems.append("split.leakage_kmer must be a whole number >= 8")
+    if cfg.split.balance not in BALANCE_MODES:
+        problems.append(f"split.balance must be one of {BALANCE_MODES}, got '{cfg.split.balance}'")
 
     e = cfg.evaluation
     if not isinstance(e.n_seeds, int) or e.n_seeds < 1:
@@ -321,6 +331,10 @@ def validate(cfg: Config) -> None:
         problems.append("evaluation.bootstrap must be a whole number >= 0")
     if not isinstance(e.threshold, (int, float)) or not 0 < e.threshold < 1:
         problems.append("evaluation.threshold must be between 0 and 1")
+    if e.bootstrap_unit not in BOOTSTRAP_UNITS:
+        problems.append(f"evaluation.bootstrap_unit must be one of {BOOTSTRAP_UNITS}, got '{e.bootstrap_unit}'")
+    elif e.bootstrap_unit == "pair" and cfg.split.balance == "random":
+        problems.append("evaluation.bootstrap_unit: pair needs split.balance: paired (use sequence with random)")
 
     m = cfg.model
     for key, minimum in (("max_len", 8), ("epochs", 1), ("patience", 1), ("batch_size", 1)):
@@ -396,12 +410,14 @@ negatives:
   strand_aware: true             # '+' peaks go into '+' regions, '-' into '-' (needs a strand column in genes_bed)
   qc: true                       # warn if negatives differ from positives in region class or strand (needs gtf)
   bed: null                      # pre-computed negatives BED (skips generation)
+  max_gc_diff: null              # gc-matched: drop candidates more than this GC fraction from their peak (e.g. 0.05)
 
 split:
   test_chroms: [chr21, chr22, chrX]
   val_chroms: [chr19, chr20]
   leakage: report                # report | remove val/test sequences that resemble training ones
   leakage_kmer: 20               # resemblance = identical, reverse complement, or a shared 20-mer
+  balance: paired                # paired: each peak kept with its matched negative | random: downsample at random
 
 model:
   max_len: 126                   # CNN input length; longer sequences are centre-cropped
@@ -417,6 +433,7 @@ evaluation:
   n_seeds: 1                     # e.g. 5: retrain with 5 seeds and report mean ± SD
   bootstrap: 1000                # resamples for 95% confidence intervals (0 = off)
   threshold: 0.5                 # cut-off for precision, recall, F1, MCC, confusion matrix
+  bootstrap_unit: pair           # resample pair (peak + its negative) | gene (all pairs of a gene) | sequence
 
 interpretation:                  # what the models learned (held-out test positives only)
   n_sequences: 500               # top-scoring test positives explained by the CNN

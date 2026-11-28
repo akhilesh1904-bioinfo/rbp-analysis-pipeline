@@ -48,3 +48,37 @@ def test_summarise_seeds():
     assert "n" not in s
     assert s["roc_auc"]["mean"] == pytest.approx(0.85)
     assert s["roc_auc"]["sd"] == pytest.approx(np.std([0.8, 0.9], ddof=1))
+
+
+def test_grouped_bootstrap_with_singleton_groups_matches_ungrouped():
+    rng = np.random.default_rng(0)
+    y = np.r_[np.zeros(100), np.ones(100)]
+    s = y + rng.normal(0, 1, 200)
+    groups = [f"g{i}" for i in range(200)]
+    assert bootstrap_ci(y, s, "roc_auc", 200, seed=3) == bootstrap_ci(y, s, "roc_auc", 200, seed=3, groups=groups)
+
+
+def test_grouped_bootstrap_widens_ci_when_sequences_cluster():
+    # 20 genes, each contributing 10 near-identical pairs: the effective sample is 20 genes, not 200 pairs.
+    rng = np.random.default_rng(1)
+    y, s, genes = [], [], []
+    for g in range(20):
+        shift = rng.normal(0, 1.5)          # gene-level effect shared by all its pairs
+        for _ in range(10):
+            y += [1, 0]
+            s += [1 + shift + rng.normal(0, 0.1), shift + rng.normal(0, 0.1) - 0.2]
+            genes += [f"gene{g}", f"gene{g}"]
+    flat = bootstrap_ci(y, s, "roc_auc", 400, seed=0)
+    grouped = bootstrap_ci(y, s, "roc_auc", 400, seed=0, groups=genes)
+    assert (grouped[1] - grouped[0]) > 1.5 * (flat[1] - flat[0])
+
+
+def test_grouped_paired_difference_and_length_check():
+    rng = np.random.default_rng(0)
+    y = np.r_[np.zeros(300), np.ones(300)]
+    good, bad = y + rng.normal(0, 0.5, 600), y + rng.normal(0, 2.0, 600)
+    pairs = [f"p{i}" for i in range(300)] * 2
+    d = paired_bootstrap_diff(y, good, bad, 300, seed=0, groups=pairs)
+    assert d["diff"] > 0 and d["ci_low"] > 0
+    with pytest.raises(ValueError, match="groups"):
+        bootstrap_ci(y, good, "roc_auc", 10, groups=pairs[:10])

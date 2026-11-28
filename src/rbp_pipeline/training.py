@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -29,7 +29,9 @@ def _train_once(data: SplitData, cfg: Config, seed: int) -> Dict[str, Any]:
             "mean_probs": [(c + l) / 2 for c, l in zip(cnn_probs, lr_probs)]}
 
 
-def train_and_score(data: SplitData, cfg: Config, out_dir: Path) -> Dict[str, Any]:
+def train_and_score(data: SplitData, cfg: Config, out_dir: Path,
+                    test_groups: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """test_groups: one bootstrap unit label per test sequence (None = resample sequences)."""
     log.info("\n[4/9] Training and evaluating models...")
     test_seqs, labels = data["test"]
     ev = cfg.evaluation
@@ -58,23 +60,29 @@ def train_and_score(data: SplitData, cfg: Config, out_dir: Path) -> Dict[str, An
               "gc_baseline": gc}
     for name, s in scores.items():
         for metric in ("roc_auc", "pr_auc"):
-            lo, hi = bootstrap_ci(labels, s, metric, ev.bootstrap, seed=cfg.seed)
+            lo, hi = bootstrap_ci(labels, s, metric, ev.bootstrap, seed=cfg.seed, groups=test_groups)
             metrics[name][f"{metric}_ci"] = [lo, hi]
 
     comparisons = {
-        "cnn_vs_lr": paired_bootstrap_diff(labels, scores["cnn"], scores["lr"], ev.bootstrap, cfg.seed),
-        "cnn_vs_gc_baseline": paired_bootstrap_diff(labels, scores["cnn"], gc, ev.bootstrap, cfg.seed),
-        "lr_vs_gc_baseline": paired_bootstrap_diff(labels, scores["lr"], gc, ev.bootstrap, cfg.seed),
+        "cnn_vs_lr": paired_bootstrap_diff(labels, scores["cnn"], scores["lr"], ev.bootstrap, cfg.seed, test_groups),
+        "cnn_vs_gc_baseline": paired_bootstrap_diff(labels, scores["cnn"], gc, ev.bootstrap, cfg.seed, test_groups),
+        "lr_vs_gc_baseline": paired_bootstrap_diff(labels, scores["lr"], gc, ev.bootstrap, cfg.seed, test_groups),
     }
     seed_summary = summarise_seeds(per_seed) if len(seeds) > 1 else None
 
+    n_units = len(set(test_groups)) if test_groups is not None else len(labels)
+    if ev.bootstrap > 0:
+        log.info(f"  Bootstrap unit      : {ev.bootstrap_unit if test_groups is not None else 'sequence'} "
+                 f"({n_units:,} units resampled from {len(labels):,} test sequences)")
     _log_metrics(metrics, comparisons, seed_summary, ev.bootstrap > 0)
 
     return {
         # headline numbers (first seed) — kept for scripts that read these keys
         "cnn_auc": metrics["cnn"]["roc_auc"], "lr_auc": metrics["lr"]["roc_auc"],
         "mean_auc": metrics["ensemble"]["roc_auc"], "gc_auc": metrics["gc_baseline"]["roc_auc"],
-        "metrics": metrics, "comparisons": comparisons, "seed_summary": seed_summary, "seeds": seeds,
+        "metrics": metrics, "comparisons": comparisons,
+        "bootstrap": {"unit": ev.bootstrap_unit if test_groups is not None else "sequence",
+                      "n_units": n_units, "n_resamples": ev.bootstrap}, "seed_summary": seed_summary, "seeds": seeds,
         "cnn_probs": primary["cnn_probs"], "lr_probs": primary["lr_probs"], "mean_probs": primary["mean_probs"],
         "gc_scores": gc, "test_labels": labels, "test_seqs": test_seqs,
         "cnn_model": primary["cnn_model"], "cnn_history": primary["cnn_history"],

@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from bisect import bisect_right
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -185,15 +185,20 @@ def _has_regions(region_lines, group, chrom, skey) -> bool:
     return bool(_regions_for(region_lines, group, chrom, skey))
 
 
-def select_gc_matched(pos_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFrame:
+def select_gc_matched(pos_df: pd.DataFrame, cand_df: pd.DataFrame,
+                      max_gc_diff: Optional[float] = None) -> pd.DataFrame:
     """
     For each peak, keep the candidate (same length and chromosome, by construction) whose
     GC content is closest to the peak's. Each genomic interval is used at most once.
+    With `max_gc_diff` (GC fraction, e.g. 0.05 = 5 points), candidates further than that
+    from their peak are not used, so a peak may end up without a negative.
     """
     pos_gc = pos_df.set_index("peak_id")["sequence"].map(gc_fraction)
     cand = cand_df[cand_df["source_peak"].isin(pos_gc.index)].copy()
     cand["gc"] = cand["sequence"].map(gc_fraction)
     cand["gc_diff"] = (cand["gc"] - cand["source_peak"].map(pos_gc)).abs()
+    if max_gc_diff is not None:
+        cand = cand[cand["gc_diff"] <= max_gc_diff]
     cand = cand.sort_values(["gc_diff", "neg_id"])
 
     chosen, used_peaks, used_regions = [], set(), set()
@@ -208,8 +213,67 @@ def select_gc_matched(pos_df: pd.DataFrame, cand_df: pd.DataFrame) -> pd.DataFra
     out = cand.loc[chosen].sort_values("neg_id").drop(columns=["gc", "gc_diff"]).reset_index(drop=True)
     n_missing = len(pos_gc) - len(out)
     if n_missing:
-        log.info(f"  Note: {n_missing:,} peaks had no usable GC-matched candidate")
+        why = f" within {max_gc_diff:.3f} GC" if max_gc_diff is not None else ""
+        log.info(f"  Note: {n_missing:,} peaks had no usable GC-matched candidate{why}")
     return out
+
+
+def matching_report(pos_df: pd.DataFrame, neg_df: pd.DataFrame,
+                    pos_annot: Optional[pd.DataFrame] = None) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    """
+    How well each peak is matched. Returns (summary, unmatched peaks table).
+
+    summary: number and fraction of peaks without a negative, GC of matched vs unmatched peaks
+    (are hard-to-match peaks systematically different?), and the per-pair GC difference.
+    """
+    pos_gc = pos_df.set_index("peak_id")["sequence"].map(gc_fraction)
+    has_src = "source_peak" in neg_df and neg_df["source_peak"].isin(pos_gc.index).any()
+    summary: Dict[str, Any] = {"n_peaks": int(len(pos_gc))}
+    if not has_src:
+        summary["note"] = "negatives do not record their source peak; matching not assessed"
+        return summary, pd.DataFrame(columns=["peak_id", "chrom", "start", "end", "strand", "gc"])
+
+    matched = set(neg_df["source_peak"])
+    is_m = pos_gc.index.isin(matched)
+    um = pos_df[~pos_df["peak_id"].isin(matched)]
+    table = um[[c for c in ("peak_id", "chrom", "start", "end", "strand") if c in um]].copy()
+    table["gc"] = table["peak_id"].map(pos_gc).round(4)
+    if pos_annot is not None and "region_type" in pos_annot:
+        table = table.merge(pos_annot[["peak_id", "region_type"]], on="peak_id", how="left")
+
+    neg = neg_df[neg_df["source_peak"].isin(pos_gc.index)]
+    diff = (neg["sequence"].map(gc_fraction) - neg["source_peak"].map(pos_gc)).abs()
+
+    def _mean(x):
+        return float(x.mean()) if len(x) else float("nan")
+    summary.update({
+        "n_unmatched": int((~is_m).sum()), "fraction_unmatched": float((~is_m).mean()) if len(is_m) else 0.0,
+        "gc_matched_peaks": _mean(pos_gc[is_m]), "gc_unmatched_peaks": _mean(pos_gc[~is_m]),
+        "pair_gc_diff_median": float(diff.median()) if len(diff) else float("nan"),
+        "pair_gc_diff_p95": float(diff.quantile(0.95)) if len(diff) else float("nan"),
+        "pair_gc_diff_max": float(diff.max()) if len(diff) else float("nan"),
+    })
+    if "chrom" in um and len(um):
+        summary["unmatched_by_chrom"] = {k: int(v) for k, v in um["chrom"].value_counts().items()}
+    if "region_type" in table and len(table):
+        summary["unmatched_by_region"] = {str(k): int(v) for k, v in table["region_type"].value_counts().items()}
+    return summary, table
+
+
+def log_matching(summary: Dict[str, Any]) -> None:
+    if "n_unmatched" not in summary:
+        log.info(f"  Matching            : {summary.get('note', 'not assessed')}")
+        return
+    log.info(f"  Unmatched peaks     : {summary['n_unmatched']:,} / {summary['n_peaks']:,} "
+             f"({100 * summary['fraction_unmatched']:.1f}%) have no negative")
+    if summary["n_unmatched"]:
+        log.info(f"    GC of matched vs unmatched peaks: {100 * summary['gc_matched_peaks']:.1f}% vs "
+                 f"{100 * summary['gc_unmatched_peaks']:.1f}%")
+        if summary["fraction_unmatched"] > 0.05:
+            log.warning("    WARNING: >5% of peaks have no matched negative; they are left out of the paired "
+                        "test set, which may bias it. See unmatched_peaks.csv.")
+    log.info(f"  Pair GC difference  : median {100 * summary['pair_gc_diff_median']:.1f}, "
+             f"95th pct {100 * summary['pair_gc_diff_p95']:.1f}, max {100 * summary['pair_gc_diff_max']:.1f} points")
 
 
 def gc_summary(pos_df: pd.DataFrame, neg_df: pd.DataFrame) -> Tuple[float, float]:

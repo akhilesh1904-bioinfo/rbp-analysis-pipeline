@@ -10,7 +10,7 @@ For each protein the pipeline:
 2. Generates negatives matched to each peak's **length, chromosome, strand and GC content** (and optionally its **region class**: UTR, exonic or intronic), each lying entirely inside a region set you choose, then **checks** that negatives resemble positives in region and strand
 3. Extracts sequences in the **RNA sense** (minus-strand peaks are reverse-complemented)
 4. Trains a 1D CNN and a k-mer logistic regression on a **chromosome-held-out split**
-5. Evaluates on the test set with ROC-AUC, PR-AUC, precision, recall, F1, MCC, Brier score, confusion matrices and calibration, with **bootstrap 95% CIs**, **paired significance tests** (CNN vs LR vs a **GC-content-only baseline**) and optional **multi-seed** mean ± SD
+5. Evaluates on the test set with ROC-AUC, PR-AUC, precision, recall, F1, MCC, Brier score, confusion matrices and calibration, with **bootstrap 95% CIs** that resample each peak together with its matched negative (or all pairs from one gene), **paired significance tests** (CNN vs LR vs a **GC-content-only baseline**) and optional **multi-seed** mean ± SD
 6. Checks for **sequence leakage**: val/test sequences identical to, reverse-complementary to, or sharing a 20-mer with training sequences (report or remove)
 7. Validates the **genome build** (GRCh38 vs GRCh37 by chr1 length) and flags peaks that run past chromosome ends
 8. Annotates peaks as UTR / exonic / intronic / intergenic, **strand-aware**
@@ -74,6 +74,7 @@ Results go to `<output_dir>/<name>/`:
 | `<name>_metrics.json` / `.csv` | all test metrics with 95% CIs, paired model comparisons, seed mean ± SD, leakage summary |
 | `leakage_flags.csv` | val/test sequences resembling training sequences, with the reason |
 | `negatives_qc.csv` | region-class and antisense fractions of positives vs negatives |
+| `unmatched_peaks.csv` | peaks that got no matched negative (and so are left out of the paired splits), with their GC |
 | `figures/` | ROC and precision-recall curves (with GC baseline), calibration, confusion matrices, score distributions, CNN training curve |
 | `interpretation/` | CNN position and k-mer importance, filter motifs (`.meme`), LR k-mer coefficients, known-motif enrichment, STREME motifs, Tomtom matches, g:Profiler results, `interpretation_summary.json` |
 | `figures/interp_*.png` | importance profile around the peak centre, per-base importance logos for top test peaks, CNN filter logos, top CNN and LR k-mers, STREME motif logos |
@@ -119,6 +120,7 @@ negatives:
 evaluation:
   n_seeds: 5          # mean ± SD over 5 CNN trainings
   bootstrap: 1000     # 95% CIs and paired tests
+  bootstrap_unit: gene   # resample whole genes (needs reference.gtf)
 split:
   leakage: remove     # compare with `report` to see whether near-duplicates inflate performance
 model:
@@ -126,6 +128,17 @@ model:
 ```
 
 A model comparison counts as significant only when the paired bootstrap interval for the AUC difference excludes zero. With a few hundred test sequences, AUC differences below about 0.03 are usually within noise.
+
+### Matched pairs and uncertainty
+
+Each negative is chosen for one peak, so a peak and its negative are not independent observations, and several peaks often fall in the same gene or UTR. Treating every test sequence as independent therefore makes confidence intervals too narrow.
+
+- `split.balance: paired` (default) keeps each peak together with its own negative in every split. Peaks without a negative (no usable candidate, or its negative removed by the leakage check) and negatives whose peak is gone are dropped, so the test set is made of complete pairs. `random` downsamples the larger class at random, as before v0.6.0.
+- `evaluation.bootstrap_unit` sets what the bootstrap resamples: `pair` (default; a peak with its negative), `gene` (all pairs whose peak lies in one gene; peaks outside genes count as their own unit; needs `reference.gtf`) or `sequence` (each sequence on its own, as before v0.6.0). The paired model comparisons use the same unit. `gene` gives the most conservative intervals.
+- Every run reports how many peaks got no matched negative, their GC compared with matched peaks, and the GC difference within pairs (`matching` in the metrics JSON, `unmatched_peaks.csv`). If many peaks are unmatched, and especially if they differ in GC, the test set no longer represents all peaks: add candidates (`negatives.gc_candidates`) or widen the region classes.
+- `negatives.max_gc_diff` (e.g. `0.05`) refuses candidates more than that GC fraction from their peak. Matches become tighter, at the price of more unmatched peaks; compare the two counts before choosing.
+
+Intervals still describe resampling of one test set on fixed test chromosomes; they do not include the variation from choosing different test chromosomes.
 
 ## Interpreting the models
 

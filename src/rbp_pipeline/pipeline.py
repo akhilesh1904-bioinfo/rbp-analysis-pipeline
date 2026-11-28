@@ -4,16 +4,17 @@ from __future__ import annotations
 import logging
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from . import __version__
 from .annotation import annotate_regions, log_breakdown, region_beds_from_gtf, skip_annotation
 from .config import Config, validate
-from .dataset import assign_splits, balance_splits
+from .dataset import assign_splits, balance_splits_grouped
 from .genome import Genome, check_assembly, check_peaks_within_genome, check_reference_naming
 from .leakage import check_leakage
 from .models import DEVICE, set_seed
-from .negative_sampling import gc_summary, generate_candidates, region_qc, select_gc_matched
+from .negative_sampling import (gc_summary, generate_candidates, log_matching, matching_report, region_qc,
+                                select_gc_matched)
 from .preprocessing import read_bed, validate_bed, write_cleaned_bed
 from .reporting import (generate_word_report, make_plots, save_metrics, save_predictions,
                         save_run_info)
@@ -104,12 +105,16 @@ def run(cfg: Config) -> Dict[str, Any]:
     pos_df, neg_df = extract_sequences(peaks_df, neg_df, genome, out_dir, cfg.model.max_len)
     if strategy == "gc-matched":
         log.info(f"  Selecting GC-matched negatives from {len(neg_df):,} candidates...")
-        neg_df = select_gc_matched(pos_df, neg_df)
+        neg_df = select_gc_matched(pos_df, neg_df, n.max_gc_diff)
         neg_df[["chrom", "start", "end", "source_peak"]].assign(score=0, strand=neg_df["strand"]) \
             .to_csv(neg_bed, sep="\t", index=False, header=False)
         write_fasta(neg_df, "neg_id", out_dir / "negatives.fa")
         log.info(f"  GC-matched negatives: {len(neg_df):,}")
     pos_gc, neg_gc = gc_summary(pos_df, neg_df)
+    matching, unmatched = matching_report(pos_df, neg_df, pos_annot)
+    log_matching(matching)
+    if "n_unmatched" in matching:
+        unmatched.to_csv(out_dir / "unmatched_peaks.csv", index=False)
 
     # Region / strand QC of the negatives
     negatives_qc = None
@@ -124,10 +129,13 @@ def run(cfg: Config) -> Dict[str, Any]:
     pos_df, neg_df = assign_splits(pos_df, neg_df, cfg.split.test_chroms, cfg.split.val_chroms)
     pos_df, neg_df, leakage, leaks = check_leakage(pos_df, neg_df, cfg.split.leakage, cfg.split.leakage_kmer)
     leaks.to_csv(out_dir / "leakage_flags.csv", index=False)
-    data = balance_splits(pos_df, neg_df, cfg.seed)
-    results = train_and_score(data, cfg, out_dir)
+    gene_of = dict(zip(pos_annot["peak_id"], pos_annot["gene_name"])) if pos_annot is not None else None
+    data, groups, balance = balance_splits_grouped(pos_df, neg_df, cfg.seed, cfg.split.balance, gene_of)
+    test_groups = _bootstrap_groups(cfg, groups["test"], balance["mode"], gene_of is not None)
+    results = train_and_score(data, cfg, out_dir, test_groups)
     results.update(negative_strategy=strategy, gc_positive=pos_gc, gc_negative=neg_gc,
-                   n_test=len(data["test"][1]), leakage=leakage, negatives_qc=negatives_qc)
+                   n_test=len(data["test"][1]), leakage=leakage, negatives_qc=negatives_qc,
+                   matching=matching, balance=balance)
 
     # 5-8. Outputs
     make_plots(results, out_dir, cfg.name)
@@ -168,3 +176,17 @@ def _save_qc(qc: Dict[str, Any], path: Path) -> None:
     import pandas as pd
     rows = [{"region": k, "positives": qc["positives"][k], "negatives": qc["negatives"][k]} for k in qc["positives"]]
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _bootstrap_groups(cfg: Config, test: Dict[str, List[str]], balance_mode: str, have_genes: bool):
+    """Bootstrap unit label per test sequence, or None to resample sequences individually."""
+    unit = cfg.evaluation.bootstrap_unit
+    if unit == "sequence":
+        return None
+    if balance_mode != "paired":
+        log.info(f"  Note: evaluation.bootstrap_unit: {unit} needs paired balancing; resampling sequences instead")
+        return None
+    if unit == "gene" and not have_genes:
+        log.info("  Note: evaluation.bootstrap_unit: gene needs reference.gtf; resampling pairs instead")
+        return test["pair"]
+    return test[unit]

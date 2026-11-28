@@ -173,7 +173,8 @@ def save_predictions(pos_df: pd.DataFrame, results: Dict[str, Any], cfg: Config,
 def save_metrics(results: Dict[str, Any], out_dir: Path, name: str) -> Path:
     """<name>_metrics.json (everything) and <name>_metrics.csv (one row per model x metric)."""
     keys = ("cnn_auc", "lr_auc", "mean_auc", "gc_auc", "negative_strategy", "gc_positive", "gc_negative",
-            "n_test", "seeds", "metrics", "comparisons", "seed_summary", "leakage", "interpretation", "negatives_qc")
+            "n_test", "seeds", "metrics", "comparisons", "seed_summary", "leakage", "interpretation", "negatives_qc",
+            "matching", "balance", "bootstrap")
     payload = {k: results[k] for k in keys if k in results}
     path = out_dir / f"{name}_metrics.json"
     path.write_text(json.dumps(payload, indent=2, default=_json_default))
@@ -319,7 +320,7 @@ def generate_word_report(peaks_df: pd.DataFrame, results: Dict[str, Any], cfg: C
         "interp": _interp_methods(cfg) if results.get("interpretation") else "Interpretation step not run.",
         "eval": ("Metrics computed on held-out test chromosomes only: ROC-AUC, PR-AUC (average precision), and "
                  f"precision, recall, F1, MCC and Brier score at threshold {cfg.evaluation.threshold}, with "
-                 f"{cfg.evaluation.bootstrap} bootstrap resamples for 95% CIs"
+                 f"{cfg.evaluation.bootstrap} bootstrap resamples for 95% CIs ({_boot_unit_text(results)})"
                  + (f" and {cfg.evaluation.n_seeds} training seeds" if cfg.evaluation.n_seeds > 1 else "")
                  + f". Validation/test sequences resembling training sequences (identical, reverse complement or a "
                  f"shared {cfg.split.leakage_kmer}-mer) were {'removed' if cfg.split.leakage == 'remove' else 'counted'}. "
@@ -472,3 +473,12 @@ const doc = new Document({{
 Packer.toBuffer(doc).then(buf => {{ fs.writeFileSync({out}, buf); console.log('Report saved.'); }})
   .catch(err => {{ console.error(err); process.exit(1); }});
 """
+
+
+def _boot_unit_text(results: Dict[str, Any]) -> str:
+    unit = (results.get("bootstrap") or {}).get("unit", "sequence")
+    n = (results.get("bootstrap") or {}).get("n_units")
+    what = {"pair": "each peak resampled together with its matched negative",
+            "gene": "all matched pairs from one gene resampled together",
+            "sequence": "test sequences resampled individually"}.get(unit, unit)
+    return what + (f"; {n:,} units" if n else "")

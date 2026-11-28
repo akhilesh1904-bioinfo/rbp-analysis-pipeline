@@ -112,3 +112,30 @@ def test_region_qc_flags_antisense_and_region_mismatch(caplog):
     pos2 = pos.assign(peak_id=[f"p{i}" for i in range(10)])
     neg2 = pos.assign(source_peak=[f"p{i}" for i in range(10)])
     assert region_qc(pos2, neg2)["class_match"] == 1.0
+
+
+def test_max_gc_diff_leaves_poorly_matched_peaks_unmatched():
+    pos = pd.DataFrame({"peak_id": ["p1", "p2"], "sequence": ["GGGGCCCC", "AAAATTTT"]})
+    cand = pd.DataFrame({
+        "chrom": ["chr1"] * 2, "start": [0, 100], "end": [8, 108], "strand": ["+"] * 2,
+        "source_peak": ["p1", "p2"], "neg_id": ["n0", "n1"],
+        "sequence": ["AAAAAAAA", "AAAATTTA"],          # p1's only candidate is 100 GC points away
+    })
+    assert len(select_gc_matched(pos, cand)) == 2
+    out = select_gc_matched(pos, cand, max_gc_diff=0.05)
+    assert out["source_peak"].tolist() == ["p2"]
+
+
+def test_matching_report_counts_unmatched_peaks():
+    from rbp_pipeline.negative_sampling import matching_report
+    pos = pd.DataFrame({"peak_id": ["p1", "p2", "p3"], "chrom": ["chr1", "chr1", "chr2"],
+                        "start": [0, 10, 20], "end": [8, 18, 28], "strand": ["+"] * 3,
+                        "sequence": ["GGGGCCCC", "AAAATTTT", "GGGGGGGG"]})
+    neg = pd.DataFrame({"source_peak": ["p1", "p2"], "sequence": ["GGGGCCCA", "AAAATTTT"]})
+    summary, table = matching_report(pos, neg)
+    assert summary["n_unmatched"] == 1 and table["peak_id"].tolist() == ["p3"]
+    assert summary["gc_unmatched_peaks"] == pytest.approx(1.0)
+    assert summary["pair_gc_diff_max"] == pytest.approx(0.125)
+    assert summary["unmatched_by_chrom"] == {"chr2": 1}
+    no_src, _ = matching_report(pos, neg.drop(columns="source_peak"))
+    assert "n_unmatched" not in no_src
