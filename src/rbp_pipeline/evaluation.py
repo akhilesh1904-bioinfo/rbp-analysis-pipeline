@@ -1,7 +1,7 @@
 """Evaluation metrics on the held-out test set: threshold-free, thresholded, calibration, CIs."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from sklearn.metrics import (average_precision_score, brier_score_loss, confusion_matrix, f1_score,
@@ -48,17 +48,41 @@ def compute_metrics(labels: Sequence[int], scores: Sequence[float], threshold: O
     return out
 
 
+def _clusters(n: int, groups: Optional[Sequence]) -> List[np.ndarray]:
+    """Index arrays, one per resampling unit (each sequence on its own when groups is None)."""
+    if groups is None:
+        return [np.array([i]) for i in range(n)]
+    if len(groups) != n:
+        raise ValueError(f"groups has {len(groups)} entries for {n} sequences")
+    members: Dict[Any, List[int]] = {}
+    for i, g in enumerate(groups):
+        members.setdefault(g, []).append(i)
+    return [np.array(v) for v in members.values()]
+
+
+def _resample(rng: np.random.Generator, clusters: List[np.ndarray]) -> np.ndarray:
+    """Draw as many units as there are, with replacement, and return their pooled indices."""
+    pick = rng.integers(0, len(clusters), len(clusters))
+    return np.concatenate([clusters[i] for i in pick])
+
+
 def bootstrap_ci(labels: Sequence[int], scores: Sequence[float], metric: str = "roc_auc",
-                 n_boot: int = 1000, seed: int = 0, alpha: float = 0.05) -> Tuple[float, float]:
-    """Percentile bootstrap CI over test sequences (resampling positives and negatives together)."""
+                 n_boot: int = 1000, seed: int = 0, alpha: float = 0.05,
+                 groups: Optional[Sequence] = None) -> Tuple[float, float]:
+    """
+    Percentile bootstrap CI. Without `groups`, test sequences are resampled one by one. With
+    `groups` (one label per sequence), whole groups are resampled: e.g. a peak together with
+    its matched negative, or all pairs from one gene, so dependent sequences stay together.
+    """
     if n_boot <= 0:
         return (float("nan"), float("nan"))
     fn = roc_auc_score if metric == "roc_auc" else average_precision_score
     y, s = np.asarray(labels), np.asarray(scores, dtype=float)
+    clusters = _clusters(len(y), groups)
     rng = np.random.default_rng(seed)
     vals = []
     for _ in range(n_boot):
-        idx = rng.integers(0, len(y), len(y))
+        idx = _resample(rng, clusters)
         if y[idx].min() == y[idx].max():
             continue
         vals.append(fn(y[idx], s[idx]))
@@ -67,16 +91,18 @@ def bootstrap_ci(labels: Sequence[int], scores: Sequence[float], metric: str = "
 
 
 def paired_bootstrap_diff(labels: Sequence[int], a: Sequence[float], b: Sequence[float],
-                          n_boot: int = 1000, seed: int = 0) -> Dict[str, float]:
-    """ROC-AUC(a) - ROC-AUC(b) on the same test set, with a paired bootstrap 95% CI."""
+                          n_boot: int = 1000, seed: int = 0,
+                          groups: Optional[Sequence] = None) -> Dict[str, float]:
+    """ROC-AUC(a) - ROC-AUC(b) on the same test set, with a paired (optionally grouped) bootstrap 95% CI."""
     y, a, b = np.asarray(labels), np.asarray(a, dtype=float), np.asarray(b, dtype=float)
     diff = float(roc_auc_score(y, a) - roc_auc_score(y, b))
     if n_boot <= 0:
         return {"diff": diff, "ci_low": float("nan"), "ci_high": float("nan")}
+    clusters = _clusters(len(y), groups)
     rng = np.random.default_rng(seed)
     vals = []
     for _ in range(n_boot):
-        idx = rng.integers(0, len(y), len(y))
+        idx = _resample(rng, clusters)
         if y[idx].min() == y[idx].max():
             continue
         vals.append(roc_auc_score(y[idx], a[idx]) - roc_auc_score(y[idx], b[idx]))

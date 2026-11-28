@@ -27,12 +27,14 @@ negatives:
   strand_aware: true             # '+' peaks go into '+' regions, '-' into '-' (needs a strand column in genes_bed)
   qc: true                       # warn if negatives differ from positives in region class or strand (needs gtf)
   bed: null                      # pre-computed negatives BED (skips generation)
+  max_gc_diff: null              # gc-matched: drop candidates more than this GC fraction from their peak (e.g. 0.05)
 
 split:
   test_chroms: [chr21, chr22, chrX]
   val_chroms: [chr19, chr20]
   leakage: report                # report | remove val/test sequences that resemble training ones
   leakage_kmer: 20               # resemblance = identical, reverse complement, or a shared 20-mer
+  balance: paired                # paired: each peak kept with its matched negative | random: downsample at random
 
 model:
   max_len: 126                   # CNN input length; longer sequences are centre-cropped
@@ -48,6 +50,7 @@ evaluation:
   n_seeds: 1                     # e.g. 5: retrain with 5 seeds and report mean ± SD
   bootstrap: 1000                # resamples for 95% confidence intervals (0 = off)
   threshold: 0.5                 # cut-off for precision, recall, F1, MCC, confusion matrix
+  bootstrap_unit: pair           # resample pair (peak + its negative) | gene (all pairs of a gene) | sequence
 
 interpretation:                  # what the models learned (held-out test positives only)
   n_sequences: 500               # top-scoring test positives explained by the CNN

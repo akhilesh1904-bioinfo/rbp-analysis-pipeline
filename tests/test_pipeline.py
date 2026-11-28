@@ -59,6 +59,12 @@ def test_full_pipeline_from_config(synthetic_config, strategy):
 
     metrics = json.loads((out / "SYN_metrics.json").read_text())
     assert metrics["cnn_auc"] == pytest.approx(results["cnn_auc"])
+
+    # Paired balancing and pair-level bootstrap (defaults); unmatched peaks reported
+    assert metrics["balance"]["mode"] == "paired"
+    assert metrics["bootstrap"]["unit"] == "pair"
+    assert metrics["bootstrap"]["n_units"] * 2 == results["n_test"]
+    assert "n_unmatched" in metrics["matching"] and (out / "unmatched_peaks.csv").exists()
     info = json.loads((out / "run_info.json").read_text())
     assert info["config"]["negatives"]["strategy"] == strategy and "torch" in info["versions"]
     assert "DONE" in (out / "pipeline.log").read_text()
@@ -259,3 +265,13 @@ def test_leakage_remove_mode_runs(synthetic_config):
     preds = pd.read_csv(d["tmp"] / "results" / "SYN" / "SYN_predictions.csv")
     test_ids = set(preds.loc[preds.split == "test", "peak_id"])
     assert test_ids.isdisjoint(set(flags["seq_id"]))
+
+
+@needs_tools
+def test_gene_bootstrap_unit_and_gc_tolerance(synthetic_config):
+    cfg_path, d = synthetic_config
+    res = run(load_config(cfg_path, ["evaluation.bootstrap_unit=gene", "negatives.max_gc_diff=0.02",
+                                     "steps.interpretation=false", "model.epochs=2"]))
+    assert res["bootstrap"]["unit"] == "gene"
+    assert res["bootstrap"]["n_units"] < res["n_test"] // 2           # several pairs share a gene
+    assert res["matching"]["pair_gc_diff_max"] <= 0.02 + 1e-9

@@ -70,3 +70,38 @@ def test_weight_decay_and_dropout_change_training():
                     ModelConfig(max_len=40, epochs=2, weight_decay=0.1, dropout=0.5), seed=3)[0]
     assert reg.classifier[2].p == 0.5
     assert not torch.equal(base.conv1.weight, reg.conv1.weight)
+
+
+def _paired_frames():
+    # 6 peaks on chr1 (train), 2 on chr19 (val), 3 on chr21 (test); p10 has no negative,
+    # and n_orphan's peak is not in the data (e.g. removed by the leakage check).
+    chroms = ["chr1"] * 6 + ["chr19"] * 2 + ["chr21"] * 3
+    pos = pd.DataFrame({"peak_id": [f"p{i}" for i in range(11)], "chrom": chroms,
+                        "sequence": [f"P{i}" for i in range(11)], "split": None})
+    neg = pd.DataFrame({"neg_id": [f"n{i}" for i in range(10)] + ["n_orphan"],
+                        "source_peak": [f"p{i}" for i in range(10)] + ["p_gone"],
+                        "chrom": chroms[:10] + ["chr21"], "sequence": [f"N{i}" for i in range(10)] + ["NX"]})
+    from rbp_pipeline.dataset import assign_splits
+    return assign_splits(pos, neg, ["chr21"], ["chr19"])
+
+
+def test_paired_balancing_keeps_matched_pairs_together():
+    from rbp_pipeline.dataset import balance_splits_grouped
+    pos, neg = _paired_frames()
+    genes = {"p8": "GENEA", "p9": "GENEA", "p10": "GENEB"}
+    data, groups, summary = balance_splits_grouped(pos, neg, seed=0, mode="paired", gene_of=genes)
+    seqs, labels = data["test"]
+    assert sorted(seqs) == ["N8", "N9", "P8", "P9"]          # p10 (no negative) and the orphan dropped
+    pair = dict(zip(seqs, groups["test"]["pair"]))
+    assert pair["P8"] == pair["N8"] == "p8" and pair["P9"] == pair["N9"] == "p9"
+    assert set(groups["test"]["gene"]) == {"gene:GENEA"}
+    assert summary["test"]["positives_dropped"] == 1 and summary["test"]["negatives_dropped"] == 1
+    assert summary["mode"] == "paired"
+
+
+def test_paired_balancing_falls_back_without_source_peaks():
+    from rbp_pipeline.dataset import balance_splits_grouped
+    pos, neg = _paired_frames()
+    data, groups, summary = balance_splits_grouped(pos, neg.drop(columns="source_peak"), seed=0, mode="paired")
+    assert summary["mode"] == "random"
+    assert len(set(groups["test"]["pair"])) == len(data["test"][0])   # every sequence its own unit

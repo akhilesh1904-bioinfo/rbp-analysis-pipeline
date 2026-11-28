@@ -28,6 +28,7 @@ split:
 evaluation:
   n_seeds: 5
   bootstrap: 1000
+  bootstrap_unit: gene                   # resample whole genes: peaks in one gene/UTR are not independent
 
 model:
   lr_kmers: [3, 4, 5]                    # readable LR k-mers, long enough for 4-5 nt motifs

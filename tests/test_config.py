@@ -112,3 +112,18 @@ def test_cli_validate(files, capsys):
     assert "OK" in capsys.readouterr().out
     assert main(["validate", str(minimal(files, input="nope.bed"))]) == 1
     assert "input not found" in capsys.readouterr().err
+
+
+
+def test_balance_and_bootstrap_unit_validated(tmp_path):
+    cfg = Config(name="x", input=str(tmp_path / "missing.bed"))
+    cfg.split.balance = "random"                      # pair-level bootstrap needs paired balancing
+    cfg.negatives.max_gc_diff = 5
+    with pytest.raises(ConfigError) as e:
+        validate(cfg)
+    assert "bootstrap_unit: pair needs split.balance: paired" in str(e.value)
+    assert "negatives.max_gc_diff" in str(e.value)
+    cfg.split.balance, cfg.evaluation.bootstrap_unit = "shuffle", "peak"
+    with pytest.raises(ConfigError) as e:
+        validate(cfg)
+    assert "split.balance must be one of" in str(e.value) and "evaluation.bootstrap_unit must be one of" in str(e.value)
